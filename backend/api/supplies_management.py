@@ -1,0 +1,653 @@
+from fastapi import APIRouter, Depends, HTTPException, Header, UploadFile, File, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, func, or_
+from database import get_db, Supply, Facility, SupplyLog, User, Acquiring
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+from jose import JWTError, jwt
+from api.auth_utils import SECRET_KEY, ALGORITHM, get_philippine_time
+import os
+import uuid
+import math
+import re
+
+router = APIRouter()
+
+# Ensure upload directory exists
+UPLOAD_DIR = "uploads/supply-images"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Authentication dependency
+async def verify_token(authorization: Optional[str] = Header(None)):
+    """Verify JWT token from Authorization header"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return {"email": email}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+# Pydantic models
+class SupplyCreate(BaseModel):
+    name: str
+    category: str
+    quantity: int = 0
+    stocking_point: int = 0
+    stock_unit: str
+    facility_id: Optional[int] = None
+    description: Optional[str] = None
+    image: Optional[str] = None
+    remarks: Optional[str] = None
+
+class SupplyUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    quantity: Optional[int] = None
+    stocking_point: Optional[int] = None
+    stock_unit: Optional[str] = None
+    facility_id: Optional[int] = None
+    description: Optional[str] = None
+    image: Optional[str] = None
+    remarks: Optional[str] = None
+
+class BulkDeleteRequest(BaseModel):
+    supply_ids: List[int]
+
+class BulkImportRequest(BaseModel):
+    supplies: List[SupplyCreate]
+
+class LogActionRequest(BaseModel):
+    action: str
+    supply_id: Optional[int] = None
+    supply_name: Optional[str] = None
+    details: Optional[str] = None
+    
+    class Config:
+        # Allow extra fields from frontend
+        extra = "allow"
+
+# Helper function to save uploaded file
+async def save_upload_file(upload_file: UploadFile) -> str:
+    """Save uploaded file and return the URL path"""
+    # Validate file type
+    allowed_types = ["image/png", "image/jpeg", "image/jpg"]
+    if upload_file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only PNG and JPEG images are allowed")
+    
+    # Validate file size (max 5MB)
+    contents = await upload_file.read()
+    if len(contents) > 5 * 1024 * 1024:  # 5MB
+        raise HTTPException(status_code=400, detail="File size must not exceed 5MB")
+    
+    # Generate unique filename
+    file_extension = upload_file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_extension}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    # Save file
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    
+    # Return URL path
+    return f"/uploads/supply-images/{unique_filename}"
+
+# Helper function to format supply response
+async def format_supply_response(supply: Supply, db: AsyncSession):
+    """Format supply with facility information"""
+    facility_data = None
+    if supply.facility_id:
+        facility_result = await db.execute(
+            select(Facility).where(Facility.facility_id == supply.facility_id)
+        )
+        facility = facility_result.scalar_one_or_none()
+        if facility:
+            facility_data = {
+                "id": facility.facility_id,
+                "name": facility.facility_name
+            }
+    
+    return {
+        "id": supply.supply_id,
+        "name": supply.supply_name,
+        "category": supply.category,
+        "quantity": supply.quantity,
+        "stocking_point": supply.stocking_point,
+        "stock_unit": supply.stock_unit,
+        "description": supply.description,
+        "image": supply.image_url,
+        "remarks": supply.remarks,
+        "facilities": facility_data,
+        "created_at": supply.created_at.isoformat() if supply.created_at else None,
+        "updated_at": supply.updated_at.isoformat() if supply.updated_at else None
+    }
+
+@router.get("/supplies")
+async def get_all_supplies(
+    db: AsyncSession = Depends(get_db)
+):
+    """Get all supplies with full details - Public endpoint, no authentication required"""
+    try:
+        result = await db.execute(select(Supply))
+        supplies = result.scalars().all()
+        
+        supplies_list = []
+        for supply in supplies:
+            supply_data = await format_supply_response(supply, db)
+            supplies_list.append(supply_data)
+        
+        return supplies_list
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching supplies: {str(e)}")
+
+@router.get("/facilities")
+async def get_all_facilities(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Get all available facilities"""
+    try:
+        result = await db.execute(select(Facility))
+        facilities = result.scalars().all()
+        
+        facilities_list = [
+            {
+                "id": facility.facility_id,
+                "name": facility.facility_name
+            }
+            for facility in facilities
+        ]
+        
+        return facilities_list
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching facilities: {str(e)}")
+
+@router.get("/supplies/{supply_id}/history")
+async def get_supply_history(
+    supply_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Get history of requests for a specific supply"""
+    try:
+        # Debug logging
+        print(f"Fetching history for supply_id: {supply_id}")
+        
+        query = (
+            select(Acquiring, User)
+            .join(User, Acquiring.acquirers_id == User.id)
+            .where(Acquiring.supply_id == supply_id)
+            .order_by(Acquiring.created_at.desc())
+        )
+        
+        result = await db.execute(query)
+        records = result.all()
+        
+        print(f"Found {len(records)} records")
+
+        history = []
+        for acquiring, user in records:
+            request_date = "N/A"
+            try:
+                if acquiring.created_at:
+                    if hasattr(acquiring.created_at, 'strftime'):
+                        request_date = acquiring.created_at.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        # Parse string if necessary or just use the string
+                        request_date = str(acquiring.created_at)
+            except Exception as e:
+                print(f"Error formatting date: {e}")
+                request_date = str(acquiring.created_at)
+
+            history.append({
+                "id": acquiring.id,
+                "borrower_name": f"{user.first_name} {user.last_name}",
+                "purpose": acquiring.purpose,
+                "request_date": request_date,
+                "quantity": acquiring.quantity,
+                "request_status": acquiring.status
+            })
+            
+        return history
+    
+    except Exception as e:
+        print(f"CRITICAL ERROR in get_supply_history: {type(e).__name__}: {str(e)}")
+        # Return empty list instead of 500 to prevent UI crash, but log error
+        return []
+
+@router.post("/supplies/upload-image")
+async def upload_supply_image(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Upload an image for a supply item"""
+    try:
+        # Save the uploaded file
+        image_url = await save_upload_file(file)
+        
+        return {
+            "image_url": f"http://localhost:8000{image_url}"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading image: {str(e)}")
+
+@router.post("/supplies", status_code=201)
+async def create_supply(
+    supply_data: SupplyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Create a new supply item"""
+    try:
+        # Validate required fields
+        if not supply_data.name or not supply_data.category or not supply_data.stock_unit:
+            raise HTTPException(
+                status_code=400,
+                detail="Name, category, and stock_unit are required"
+            )
+        
+        # Validate facility_id if provided
+        if supply_data.facility_id:
+            facility_result = await db.execute(
+                select(Facility).where(Facility.facility_id == supply_data.facility_id)
+            )
+            if not facility_result.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Invalid facility_id")
+        
+        # Create new supply
+        new_supply = Supply(
+            supply_name=supply_data.name,
+            category=supply_data.category,
+            quantity=supply_data.quantity,
+            stocking_point=supply_data.stocking_point,
+            stock_unit=supply_data.stock_unit,
+            facility_id=supply_data.facility_id,
+            description=supply_data.description,
+            image_url=supply_data.image,
+            remarks=supply_data.remarks,
+            created_at=get_philippine_time()
+        )
+        
+        db.add(new_supply)
+        await db.commit()
+        await db.refresh(new_supply)
+        
+        # Format response with facility data
+        response = await format_supply_response(new_supply, db)
+        
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creating supply: {str(e)}")
+
+@router.put("/supplies/{supply_id}")
+async def update_supply(
+    supply_id: int,
+    supply_data: SupplyUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Update an existing supply item"""
+    try:
+        # Get supply
+        result = await db.execute(
+            select(Supply).where(Supply.supply_id == supply_id)
+        )
+        supply = result.scalar_one_or_none()
+        
+        if not supply:
+            raise HTTPException(status_code=404, detail="Supply not found")
+        
+        # Validate facility_id if provided
+        if supply_data.facility_id is not None:
+            facility_result = await db.execute(
+                select(Facility).where(Facility.facility_id == supply_data.facility_id)
+            )
+            if not facility_result.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Invalid facility_id")
+        
+        # Update fields
+        if supply_data.name is not None:
+            supply.supply_name = supply_data.name
+        if supply_data.category is not None:
+            supply.category = supply_data.category
+        if supply_data.quantity is not None:
+            supply.quantity = supply_data.quantity
+        if supply_data.stocking_point is not None:
+            supply.stocking_point = supply_data.stocking_point
+        if supply_data.stock_unit is not None:
+            supply.stock_unit = supply_data.stock_unit
+        if supply_data.facility_id is not None:
+            supply.facility_id = supply_data.facility_id
+        if supply_data.description is not None:
+            supply.description = supply_data.description
+        if supply_data.image is not None:
+            supply.image_url = supply_data.image
+        if supply_data.remarks is not None:
+            supply.remarks = supply_data.remarks
+        
+        supply.updated_at = get_philippine_time()
+        
+        await db.commit()
+        await db.refresh(supply)
+        
+        # Format response with facility data
+        response = await format_supply_response(supply, db)
+        
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error updating supply: {str(e)}")
+
+@router.delete("/supplies/bulk-delete")
+@router.post("/supplies/bulk-delete")
+async def delete_supplies(
+    request: BulkDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Delete multiple supply items (supports both DELETE and POST methods)"""
+    try:
+        if not request.supply_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="supply_ids must be a non-empty array"
+            )
+        
+        # Get supplies to delete
+        result = await db.execute(
+            select(Supply).where(Supply.supply_id.in_(request.supply_ids))
+        )
+        supplies = result.scalars().all()
+        found_count = len(supplies)
+        
+        # Delete supplies
+        await db.execute(
+            delete(Supply).where(Supply.supply_id.in_(request.supply_ids))
+        )
+        await db.commit()
+        
+        # Determine response message
+        total_requested = len(request.supply_ids)
+        if found_count == total_requested:
+            message = f"Successfully deleted {found_count} supplies"
+        else:
+            not_found = total_requested - found_count
+            message = f"Deleted {found_count} supplies, {not_found} not found"
+        
+        return {
+            "deleted": found_count,
+            "message": message
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error deleting supplies: {str(e)}")
+
+@router.post("/supplies/bulk-import")
+async def bulk_import_supplies(
+    request: BulkImportRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Import multiple supplies from CSV data"""
+    try:
+        if not request.supplies:
+            raise HTTPException(
+                status_code=400,
+                detail="supplies must be a non-empty array"
+            )
+        
+        imported_count = 0
+        failed_count = 0
+        
+        for supply_data in request.supplies:
+            try:
+                # Validate required fields
+                if not supply_data.name or not supply_data.category or not supply_data.stock_unit:
+                    failed_count += 1
+                    continue
+                
+                # Validate facility_id if provided
+                if supply_data.facility_id:
+                    facility_result = await db.execute(
+                        select(Facility).where(Facility.facility_id == supply_data.facility_id)
+                    )
+                    if not facility_result.scalar_one_or_none():
+                        failed_count += 1
+                        continue
+                
+                # Create new supply
+                new_supply = Supply(
+                    supply_name=supply_data.name,
+                    category=supply_data.category,
+                    quantity=supply_data.quantity,
+                    stocking_point=supply_data.stocking_point,
+                    stock_unit=supply_data.stock_unit,
+                    facility_id=supply_data.facility_id,
+                    description=supply_data.description,
+                    image_url=supply_data.image,
+                    remarks=supply_data.remarks,
+                    created_at=get_philippine_time()
+                )
+                
+                db.add(new_supply)
+                imported_count += 1
+                
+            except Exception:
+                failed_count += 1
+                continue
+        
+        await db.commit()
+        
+        # Determine response message
+        if failed_count == 0:
+            message = f"Successfully imported {imported_count} supplies"
+        else:
+            message = f"Imported {imported_count} supplies, {failed_count} failed"
+        
+        return {
+            "imported": imported_count,
+            "failed": failed_count,
+            "message": message
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error importing supplies: {str(e)}")
+
+@router.post("/supply-logs")
+@router.post("/supplies/log-action")
+async def log_supply_action(
+    log_data: LogActionRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Log supply management actions (create, update, delete)
+    Supports both /supply-logs and /supplies/log-action endpoints
+    """
+    try:
+        # Construct details with supply name if provided
+        log_details = log_data.details
+        if log_data.supply_name and log_data.details:
+            # Prepend supply name to details for better log messages
+            log_details = f"{log_data.supply_name}: {log_data.details}"
+        elif log_data.supply_name:
+            log_details = log_data.supply_name
+        
+        # Create supply log entry
+        new_log = SupplyLog(
+            supply_id=log_data.supply_id,
+            action=log_data.action,
+            details=log_details,
+            user_email=current_user["email"],
+            created_at=get_philippine_time()
+        )
+        
+        db.add(new_log)
+        await db.commit()
+        await db.refresh(new_log)
+        
+        return {
+            "success": True,
+            "message": "Action logged successfully",
+            "log_id": new_log.id
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error logging action: {str(e)}")
+
+@router.get("/supplies/logs")
+async def get_supply_logs(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=10000),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Get paginated supply logs for monitoring page
+    Returns logs with formatted log_message field for frontend display
+    """
+    try:
+        # Base conditions
+        conditions = []
+        if search:
+            search_pattern = f"%{search}%"
+            conditions.append(
+                or_(
+                    SupplyLog.action.ilike(search_pattern),
+                    SupplyLog.details.ilike(search_pattern),
+                    SupplyLog.user_email.ilike(search_pattern),
+                    Supply.supply_name.ilike(search_pattern),
+                    User.first_name.ilike(search_pattern),
+                    User.last_name.ilike(search_pattern)
+                )
+            )
+
+        # Get total count
+        count_query = select(func.count(SupplyLog.id))
+        if search:
+             count_query = count_query.outerjoin(Supply, SupplyLog.supply_id == Supply.supply_id)
+             count_query = count_query.outerjoin(User, SupplyLog.user_email == User.email)
+             for condition in conditions:
+                 count_query = count_query.where(condition)
+        
+        count_result = await db.execute(count_query)
+        total_count = count_result.scalar() or 0
+        
+        # Calculate pagination
+        total_pages = math.ceil(total_count / limit) if total_count > 0 else 1
+        offset = (page - 1) * limit
+        
+        # Get logs with pagination
+        query = select(SupplyLog)
+        if search:
+            query = query.outerjoin(Supply, SupplyLog.supply_id == Supply.supply_id)
+            query = query.outerjoin(User, SupplyLog.user_email == User.email)
+            for condition in conditions:
+                query = query.where(condition)
+
+        query = (
+            query
+            .order_by(SupplyLog.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        
+        result = await db.execute(query)
+        logs = result.scalars().all()
+        
+        # Format response with log_message field
+        logs_data = []
+        for log in logs:
+            # Get supply name if supply_id exists
+            supply_name = "Supply"
+            if log.supply_id:
+                supply_result = await db.execute(
+                    select(Supply).where(Supply.supply_id == log.supply_id)
+                )
+                supply = supply_result.scalar_one_or_none()
+                if supply:
+                    supply_name = supply.supply_name
+            
+            # Get admin info
+            user_identifier = "Unknown Admin"
+            if log.user_email:
+                user_result = await db.execute(select(User).where(User.email == log.user_email))
+                user = user_result.scalar_one_or_none()
+                if user:
+                    user_identifier = f"{user.first_name} {user.last_name}"
+                else:
+                    user_identifier = log.user_email.split("@")[0]
+            
+            # Try to extract supply name from details if it contains it
+            # Details format is often: "supply_name: Category: X, Quantity: Y"
+            if log.details:
+                # Remove ID references from details to make it clearer for users
+                clean_details = re.sub(r'\s*ID\s*\d+', '', log.details)
+                
+                if any(keyword in clean_details.lower() for keyword in ["approved", "rejected", "deleted", "created", "updated"]):
+                     # If details already contains the action and potentially the supply name (from new format)
+                     # e.g. "Acquiring request deleted for Ballpen"
+                     log_message = f"Admin {user_identifier} {clean_details}"
+                else:
+                    # Check if details starts with a supply name (before the colon)
+                    details_parts = clean_details.split(": ", 1)
+                    if len(details_parts) > 1 and "Category" not in details_parts[0]:
+                        # First part is likely the supply name
+                        actual_supply_name = details_parts[0]
+                        remaining_details = details_parts[1]
+                        log_message = f"Admin {user_identifier} {log.action} for {actual_supply_name} - {remaining_details}"
+                    else:
+                        log_message = f"Admin {user_identifier} {log.action} for {supply_name} - {clean_details}"
+            else:
+                log_message = f"Admin {user_identifier} {log.action} for {supply_name}"
+            
+            logs_data.append({
+                "id": log.id,
+                "log_message": log_message,
+                "created_at": log.created_at.isoformat() if log.created_at else None
+            })
+        
+        return {
+            "logs": logs_data,
+            "total_count": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching supply logs: {str(e)}")

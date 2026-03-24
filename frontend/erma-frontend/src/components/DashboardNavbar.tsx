@@ -1,0 +1,1369 @@
+"use client";
+
+import React, { useEffect, useState, useCallback } from "react";
+import {
+  Menu,
+  X,
+  LayoutDashboard,
+  User,
+  LogOut,
+  Home,
+  Palette,
+  Bell,
+  Package,
+  CheckCircle,
+  XCircle,
+  ClipboardList,
+} from "lucide-react";
+import Image from "next/image";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useAuthStore } from "@/store";
+import { useAlert } from "@/contexts/AlertContext";
+import {
+  ReturnNotification,
+  DoneNotification,
+  RequestNotification,
+  fetchReturnNotifications,
+  fetchDoneNotifications,
+  fetchRequestNotifications,
+  confirmReturn,
+  rejectReturn,
+  confirmDone,
+  dismissDone,
+} from "@/app/dashboard-request/utils/helpers";
+import { fetchWithRetry, API_BASE_URL } from "@/utils/api";
+
+type Notification = {
+  id: string;
+  title: string;
+  user_id: string;
+  message: string;
+  is_read: boolean;
+  created_at: string;
+};
+
+const DashboardNavbar: React.FC = () => {
+  const router = useRouter();
+  const { user, isAuthenticated, logout } = useAuthStore();
+  const { showAlert } = useAlert();
+  const [isOpen, setIsOpen] = useState(false);
+  const [isAvatarDropdownOpen, setIsAvatarDropdownOpen] = useState(false);
+  const [theme, setTheme] = useState("light");
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [isNotificationDropdownOpen, setIsNotificationDropdownOpen] =
+    useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [userData, setUserData] = useState<{
+    email: string;
+    first_name?: string;
+    last_name?: string;
+  } | null>(null);
+
+  // Return Notifications State
+  const [returnNotifications, setReturnNotifications] = useState<
+    ReturnNotification[]
+  >([]);
+  const [returnNotificationsCount, setReturnNotificationsCount] = useState(0);
+
+  // Done Notifications State
+  const [doneNotifications, setDoneNotifications] = useState<
+    DoneNotification[]
+  >([]);
+  const [doneNotificationsCount, setDoneNotificationsCount] = useState(0);
+
+  // Request Notifications State
+  const [requestNotifications, setRequestNotifications] = useState<
+    RequestNotification[]
+  >([]);
+  const [requestNotificationsCount, setRequestNotificationsCount] = useState(0);
+
+  const [activeNotificationTab, setActiveNotificationTab] = useState<
+    "general" | "returns" | "done" | "requests"
+  >("general");
+
+  const toggleMenu = () => setIsOpen(!isOpen);
+  const toggleAvatarDropdown = () => {
+    setIsAvatarDropdownOpen(!isAvatarDropdownOpen);
+    setIsNotificationDropdownOpen(false);
+  };
+
+  const toggleNotificationDropdown = () => {
+    setIsNotificationDropdownOpen(!isNotificationDropdownOpen);
+    setIsAvatarDropdownOpen(false);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setIsAvatarDropdownOpen(false);
+      showAlert({
+        type: "success",
+        message: "You have been logged out successfully.",
+      });
+      setTimeout(() => {
+        router.push("/login");
+      }, 1500);
+    } catch (error) {
+      console.error("Logout error:", error);
+      showAlert({
+        type: "error",
+        message: "Failed to logout. Please try again.",
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      const storedUserData = localStorage.getItem("userData");
+      if (storedUserData) {
+        try {
+          const parsedUserData = JSON.parse(storedUserData);
+          setUserData(parsedUserData);
+        } catch {
+          setUserData({
+            email: user.email,
+            first_name: undefined,
+          });
+        }
+      } else {
+        setUserData({
+          email: user.email,
+          first_name: undefined,
+        });
+      }
+    } else {
+      setUserData(null);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    // Prefetch common pages for faster navigation
+    router.prefetch("/dashboard-request");
+    router.prefetch("/my-requests");
+    router.prefetch("/profile");
+    router.prefetch("/login");
+  }, [router]);
+
+  const applyTheme = (newTheme: string) => {
+    const root = document.documentElement;
+
+    // Remove existing theme classes
+    root.classList.remove("light", "dark");
+
+    if (newTheme === "dark") {
+      root.classList.add("dark");
+    } else if (newTheme === "light") {
+      root.classList.add("light");
+    } else if (newTheme === "system") {
+      // Check system preference and apply accordingly
+      const prefersDark = window.matchMedia(
+        "(prefers-color-scheme: dark)",
+      ).matches;
+      root.classList.add(prefersDark ? "dark" : "light");
+    }
+  };
+
+  const handleThemeChange = (newTheme: string) => {
+    setTheme(newTheme);
+    localStorage.setItem("theme", newTheme);
+    applyTheme(newTheme);
+    setIsAvatarDropdownOpen(false);
+  };
+
+  useEffect(() => {
+    // Load theme from localStorage or default to light
+    const savedTheme = localStorage.getItem("theme");
+
+    if (savedTheme && ["light", "dark", "system"].includes(savedTheme)) {
+      setTheme(savedTheme);
+      applyTheme(savedTheme);
+    } else {
+      // Default to light theme
+      setTheme("light");
+      localStorage.setItem("theme", "light");
+      applyTheme("light");
+    }
+
+    // Listen for system theme changes
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleSystemThemeChange = () => {
+      const currentTheme = localStorage.getItem("theme");
+      if (currentTheme === "system") {
+        applyTheme("system");
+      }
+    };
+
+    mediaQuery.addEventListener("change", handleSystemThemeChange);
+
+    return () => {
+      mediaQuery.removeEventListener("change", handleSystemThemeChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      if (!target.closest(".dropdown-container")) {
+        setIsAvatarDropdownOpen(false);
+        setIsNotificationDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
+  const getInitial = () => {
+    if (!userData) return "?";
+
+    const firstName = userData.first_name;
+    const lastName = userData.last_name;
+
+    if (firstName && lastName) {
+      return (firstName.charAt(0) + lastName.charAt(0)).toUpperCase();
+    } else if (firstName) {
+      return firstName.substring(0, 2).toUpperCase();
+    } else if (userData.email) {
+      return userData.email.substring(0, 2).toUpperCase();
+    }
+    return "?";
+  };
+
+  const fetchNotifications = useCallback(async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const token = localStorage.getItem("authToken");
+      if (!token) return;
+
+      const response = await fetchWithRetry(
+        `${API_BASE_URL}/api/notifications`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        setNotifications(data || []);
+        const unread = (data || []).filter(
+          (notif: Notification) => !notif.is_read,
+        ).length;
+        setUnreadCount(unread);
+      }
+    } catch (error) {
+      console.error("Error fetching notifications:", error);
+    }
+  }, [isAuthenticated]);
+
+  const fetchReturnNotificationsData = useCallback(async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const data = await fetchReturnNotifications();
+      const uniqueData = data
+        ? Array.from(new Map(data.map((item) => [item.id, item])).values())
+        : [];
+      setReturnNotifications(uniqueData);
+      setReturnNotificationsCount(uniqueData.length);
+    } catch (error) {
+      console.error("Error fetching return notifications:", error);
+    }
+  }, [isAuthenticated]);
+
+  const fetchDoneNotificationsData = useCallback(async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const data = await fetchDoneNotifications();
+      const uniqueData = data
+        ? Array.from(new Map(data.map((item) => [item.id, item])).values())
+        : [];
+      setDoneNotifications(uniqueData);
+      setDoneNotificationsCount(uniqueData.length);
+    } catch (error) {
+      console.error("Error fetching done notifications:", error);
+    }
+  }, [isAuthenticated]);
+
+  const fetchRequestNotificationsData = useCallback(async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const data = await fetchRequestNotifications();
+      // Deduplicate request notifications by ID and type to prevent key errors
+      const uniqueData = data
+        ? Array.from(
+            new Map(
+              data.map((item) => [`${item.request_type}-${item.id}`, item]),
+            ).values(),
+          )
+        : [];
+      setRequestNotifications(uniqueData);
+      setRequestNotificationsCount(uniqueData.length);
+    } catch (error) {
+      console.error("Error fetching request notifications:", error);
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    if (typeof window === "undefined") return;
+
+    const baseUrl = API_BASE_URL || "http://localhost:8000";
+    const wsUrl = (() => {
+      try {
+        const url = new URL(baseUrl);
+        const shouldUseSecureWs =
+          url.protocol === "https:" || window.location.protocol === "https:";
+        url.protocol = shouldUseSecureWs ? "wss:" : "ws:";
+        return url.toString().replace(/\/$/, "");
+      } catch {
+        return baseUrl
+          .replace(/^http(s)?/, (match, isHttps) => (isHttps ? "wss" : "ws"))
+          .replace(/\/$/, "");
+      }
+    })();
+    const looksLikeJwt = (value: string) =>
+      /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+
+    const cleanRawToken = (value: string) =>
+      value
+        .trim()
+        .replace(/^Bearer\s+/i, "")
+        .replace(/^"|"$/g, "")
+        .replace(/^'|'$/g, "");
+
+    const rawAuthToken = localStorage.getItem("authToken");
+    const rawLegacyToken = localStorage.getItem("token");
+    const cleanedAuthToken = rawAuthToken ? cleanRawToken(rawAuthToken) : null;
+    const cleanedLegacyToken = rawLegacyToken
+      ? cleanRawToken(rawLegacyToken)
+      : null;
+
+    const token =
+      (cleanedAuthToken && looksLikeJwt(cleanedAuthToken)
+        ? cleanedAuthToken
+        : null) ||
+      (cleanedLegacyToken && looksLikeJwt(cleanedLegacyToken)
+        ? cleanedLegacyToken
+        : null);
+
+    if (!token) return;
+
+    // Initial fetch
+    fetchNotifications();
+    fetchReturnNotificationsData();
+    fetchDoneNotificationsData();
+    fetchRequestNotificationsData();
+
+    let ws: WebSocket | undefined;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let initialConnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let isActive = true;
+    let hasWarned = false;
+
+    const connectWebSocket = () => {
+      if (!isActive) return;
+
+      const wsEndpoint = `${wsUrl}/api/ws/notifications?token=${encodeURIComponent(token)}`;
+      const wsSafeEndpoint = `${wsUrl}/api/ws/notifications`;
+      ws = new WebSocket(wsEndpoint);
+
+      ws.onopen = () => {
+        if (process.env.NODE_ENV !== "production") {
+          // eslint-disable-next-line no-console
+          console.debug("WebSocket connected.", { endpoint: wsSafeEndpoint });
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.personalNotifications) {
+            const filteredData = data.personalNotifications || [];
+            setNotifications(filteredData);
+            const unread = filteredData.filter(
+              (notif: Notification) => !notif.is_read,
+            ).length;
+            setUnreadCount(unread);
+          }
+          if (data.returnNotifications) {
+            const uniqueData = Array.from(
+              new Map(
+                data.returnNotifications.map((item: any) => [item.id, item]),
+              ).values(),
+            );
+            setReturnNotifications(uniqueData as any);
+            setReturnNotificationsCount(uniqueData.length);
+          }
+          if (data.doneNotifications) {
+            const uniqueData = Array.from(
+              new Map(
+                data.doneNotifications.map((item: any) => [item.id, item]),
+              ).values(),
+            );
+            setDoneNotifications(uniqueData as any);
+            setDoneNotificationsCount(uniqueData.length);
+          }
+          if (data.pendingRequests) {
+            const uniqueData = Array.from(
+              new Map(
+                data.pendingRequests.map((item: any) => [
+                  `${item.request_type}-${item.id}`,
+                  item,
+                ]),
+              ).values(),
+            );
+            setRequestNotifications(uniqueData as any);
+            setRequestNotificationsCount(uniqueData.length);
+          }
+        } catch (err) {
+          console.error("Error parsing websocket message:", err);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!hasWarned && process.env.NODE_ENV !== "production") {
+          hasWarned = true;
+          // eslint-disable-next-line no-console
+          console.debug(
+            "WebSocket error (details will appear in close event).",
+          );
+        }
+      };
+
+      ws.onclose = (event) => {
+        if (!isActive) return;
+
+        if (process.env.NODE_ENV !== "production") {
+          const isNormalClose = event.code === 1000 || event.code === 1005;
+          // eslint-disable-next-line no-console
+          (isNormalClose ? console.debug : console.warn)("WebSocket closed.", {
+            endpoint: wsSafeEndpoint,
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean,
+          });
+        }
+
+        if (event.code === 1008) {
+          if (process.env.NODE_ENV !== "production") {
+            // eslint-disable-next-line no-console
+            console.warn("WebSocket closed (auth/policy). Not reconnecting.", {
+              code: event.code,
+              reason: event.reason,
+            });
+          }
+          return;
+        }
+
+        reconnectTimer = setTimeout(connectWebSocket, 5000);
+      };
+    };
+
+    // In React Strict Mode (dev), effects mount/unmount twice.
+    // Deferring the first connection avoids creating a socket that gets
+    // immediately torn down during the dev-only lifecycle cycle.
+    initialConnectTimer = setTimeout(connectWebSocket, 0);
+
+    return () => {
+      isActive = false;
+      if (initialConnectTimer) clearTimeout(initialConnectTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [
+    isAuthenticated,
+    fetchNotifications,
+    fetchReturnNotificationsData,
+    fetchDoneNotificationsData,
+    fetchRequestNotificationsData,
+  ]);
+
+  const handleNotificationClick = async (
+    notificationId: string,
+    notificationTitle: string,
+  ) => {
+    // Mark as read
+    await markNotificationAsRead(notificationId);
+
+    // Close dropdown
+    setIsNotificationDropdownOpen(false);
+
+    // Navigate based on notification type
+    const title = notificationTitle.toLowerCase();
+    if (
+      title.includes("return") ||
+      title.includes("borrowed") ||
+      title.includes("borrowing")
+    ) {
+      router.push("/dashboard-request?tab=borrowing");
+    } else if (
+      title.includes("booking") ||
+      title.includes("facility") ||
+      title.includes("done")
+    ) {
+      router.push("/dashboard-request?tab=booking");
+    } else if (
+      title.includes("acquiring") ||
+      title.includes("supply") ||
+      title.includes("supplies")
+    ) {
+      router.push("/dashboard-request?tab=acquiring");
+    } else if (title.includes("maintenance")) {
+      router.push("/monitor-maintenance");
+    } else {
+      // Default to dashboard-request page
+      router.push("/dashboard-request");
+    }
+  };
+
+  const markNotificationAsRead = async (notificationId: string) => {
+    try {
+      const token = localStorage.getItem("authToken");
+      if (!token) return;
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/notifications/${notificationId}/read`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+
+      if (response.ok) {
+        setNotifications((prev) =>
+          prev.map((notif) =>
+            notif.id === notificationId ? { ...notif, is_read: true } : notif,
+          ),
+        );
+        setUnreadCount((prev) => Math.max(0, prev - 1));
+      }
+    } catch (error) {
+      console.error("Error marking notification as read:", error);
+      fetchNotifications();
+    }
+  };
+
+  const clearAllNotifications = async () => {
+    if (!isAuthenticated) return;
+
+    try {
+      const token = localStorage.getItem("authToken");
+      if (!token) return;
+
+      const response = await fetch(`${API_BASE_URL}/api/notifications`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (response.ok) {
+        setNotifications([]);
+        setUnreadCount(0);
+      }
+    } catch (error) {
+      console.error("Error clearing notifications:", error);
+      fetchNotifications();
+    }
+  };
+
+  // Handle confirm return
+  const handleConfirmReturn = async (
+    notificationId: number,
+    borrowingId: number,
+  ) => {
+    const success = await confirmReturn(notificationId, borrowingId);
+    if (success) {
+      await fetchReturnNotificationsData();
+    }
+  };
+
+  // Handle reject return
+  const handleRejectReturn = async (notificationId: number) => {
+    const success = await rejectReturn(notificationId);
+    if (success) {
+      await fetchReturnNotificationsData();
+    }
+  };
+
+  // Handle confirm done
+  const handleConfirmDone = async (
+    notificationId: number,
+    bookingId: number,
+  ) => {
+    const success = await confirmDone(notificationId, bookingId);
+    if (success) {
+      await fetchDoneNotificationsData();
+    }
+  };
+
+  // Handle dismiss done
+  const handleDismissDone = async (notificationId: number) => {
+    const success = await dismissDone(notificationId);
+    if (success) {
+      await fetchDoneNotificationsData();
+    }
+  };
+
+  return (
+    <nav className="w-full bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 shadow-sm px-6 md:py-1 flex justify-between items-center relative">
+      <div className="flex items-center pl-40">
+        <Image
+          src="/images/logocircle.png"
+          alt="Logo"
+          width={80}
+          height={80}
+          className="h-20 w-20 object-contain"
+        />
+      </div>
+
+      {/* Desktop Avatar Only */}
+      <div className="hidden md:flex pr-40 items-center gap-4">
+        {isAuthenticated && user ? (
+          <>
+            {/* User Avatar */}
+            <div className="relative dropdown-container">
+              <button
+                onClick={toggleAvatarDropdown}
+                className="flex items-center gap-3 cursor-pointer group focus:outline-none"
+              >
+                <div className="w-10 h-10 flex items-center justify-center bg-orange-500 group-hover:bg-orange-600 text-white font-semibold rounded-full shadow group-hover:shadow-md transition duration-300">
+                  {getInitial()}
+                </div>
+
+                {userData?.first_name && userData?.last_name && (
+                  <span className="text-gray-700 dark:text-gray-300 font-medium hidden md:block group-hover:text-black dark:group-hover:text-white transition-colors">
+                    {userData.first_name} {userData.last_name}
+                  </span>
+                )}
+              </button>
+
+              {isAvatarDropdownOpen && (
+                <div className="absolute top-full right-0 mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg min-w-[180px] z-50">
+                  <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Palette size={16} />
+                      <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                        Theme
+                      </span>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleThemeChange("light")}
+                        className={`px-3 py-1 text-xs rounded ${
+                          theme === "light"
+                            ? "bg-orange-500 text-white"
+                            : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                        } transition`}
+                      >
+                        Light
+                      </button>
+                      <button
+                        onClick={() => handleThemeChange("dark")}
+                        className={`px-3 py-1 text-xs rounded ${
+                          theme === "dark"
+                            ? "bg-orange-500 text-white"
+                            : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                        } transition`}
+                      >
+                        Dark
+                      </button>
+                      <button
+                        onClick={() => handleThemeChange("system")}
+                        className={`px-3 py-1 text-xs rounded ${
+                          theme === "system"
+                            ? "bg-orange-500 text-white"
+                            : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                        } transition`}
+                      >
+                        System
+                      </button>
+                    </div>
+                  </div>
+                  <a
+                    href="/"
+                    className="flex items-center gap-2 px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                  >
+                    <Home size={16} />
+                    Back to Home
+                  </a>
+                  <hr className="border-gray-200 dark:border-gray-700" />
+                  <a
+                    href="/profile"
+                    className="flex items-center gap-2 px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                  >
+                    <User size={16} />
+                    My Profile
+                  </a>
+                  <hr className="border-gray-200 dark:border-gray-700" />
+                  <button
+                    onClick={handleLogout}
+                    className="flex items-center cursor-pointer gap-2 w-full text-left px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                  >
+                    <LogOut size={16} />
+                    Logout
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Notification Bell */}
+            <div className="relative dropdown-container">
+              <button
+                onClick={toggleNotificationDropdown}
+                className="relative p-2 text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white hover:bg-gray-200 dark:hover:bg-gray-700 rounded-full cursor-pointer transition-colors duration-300"
+              >
+                <Bell size={25} />
+                {(unreadCount > 0 ||
+                  returnNotificationsCount > 0 ||
+                  doneNotificationsCount > 0 ||
+                  requestNotificationsCount > 0) && (
+                  <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+                    {unreadCount +
+                      returnNotificationsCount +
+                      doneNotificationsCount +
+                      requestNotificationsCount >
+                    99
+                      ? "99+"
+                      : unreadCount +
+                        returnNotificationsCount +
+                        doneNotificationsCount +
+                        requestNotificationsCount}
+                  </span>
+                )}
+              </button>
+
+              {isNotificationDropdownOpen && (
+                <div className="absolute top-full right-0 mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg min-w-[350px] max-h-[450px] overflow-hidden z-50">
+                  {/* Tabs */}
+                  <div className="flex border-b border-gray-200 dark:border-gray-700">
+                    <button
+                      onClick={() => setActiveNotificationTab("general")}
+                      className={`flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
+                        activeNotificationTab === "general"
+                          ? "bg-orange-50 dark:bg-orange-900/20 text-orange-600 dark:text-orange-400 border-b-2 border-orange-500"
+                          : "text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex flex-col items-center gap-0.5">
+                        <Bell size={14} />
+                        <span className="text-[10px]">General</span>
+                        {unreadCount > 0 && (
+                          <span className="bg-red-500 text-white text-[9px] rounded-full px-1 py-0.5">
+                            {unreadCount > 99 ? "99+" : unreadCount}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => setActiveNotificationTab("returns")}
+                      className={`flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
+                        activeNotificationTab === "returns"
+                          ? "bg-orange-50 dark:bg-orange-900/20 text-orange-600 dark:text-orange-400 border-b-2 border-orange-500"
+                          : "text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex flex-col items-center gap-0.5">
+                        <Package size={14} />
+                        <span className="text-[10px]">Returns</span>
+                        {returnNotificationsCount > 0 && (
+                          <span className="bg-orange-500 text-white text-[9px] rounded-full px-1 py-0.5">
+                            {returnNotificationsCount > 99
+                              ? "99+"
+                              : returnNotificationsCount}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => setActiveNotificationTab("done")}
+                      className={`flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
+                        activeNotificationTab === "done"
+                          ? "bg-orange-50 dark:bg-orange-900/20 text-orange-600 dark:text-orange-400 border-b-2 border-orange-500"
+                          : "text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex flex-col items-center gap-0.5">
+                        <LayoutDashboard size={14} />
+                        <span className="text-[10px]">Done</span>
+                        {doneNotificationsCount > 0 && (
+                          <span className="bg-blue-500 text-white text-[9px] rounded-full px-1 py-0.5">
+                            {doneNotificationsCount > 99
+                              ? "99+"
+                              : doneNotificationsCount}
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => setActiveNotificationTab("requests")}
+                      className={`relative flex-1 px-2 py-2.5 text-xs font-medium transition-colors ${
+                        activeNotificationTab === "requests"
+                          ? "bg-orange-50 dark:bg-orange-900/20 text-orange-600 dark:text-orange-400 border-b-2 border-orange-500"
+                          : "text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <div className="flex flex-col items-center gap-0.5">
+                        <ClipboardList size={14} />
+                        <span className="text-[10px]">Requests</span>
+                      </div>
+                      {requestNotificationsCount > 0 && (
+                        <span className="absolute top-1 right-1 bg-purple-500 text-white text-[9px] rounded-full px-1.5 py-0.5 min-w-[16px] flex items-center justify-center">
+                          {requestNotificationsCount > 99
+                            ? "99+"
+                            : requestNotificationsCount}
+                        </span>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Content */}
+                  <div className="max-h-[350px] overflow-y-auto">
+                    {activeNotificationTab === "general" ? (
+                      <>
+                        <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center sticky top-0 bg-white dark:bg-gray-800">
+                          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+                            General Notifications
+                          </span>
+                          {notifications.length > 0 && (
+                            <button
+                              onClick={clearAllNotifications}
+                              className="text-xs text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 hover:underline"
+                            >
+                              Clear All
+                            </button>
+                          )}
+                        </div>
+                        {notifications.length === 0 ? (
+                          <div className="px-4 py-8 text-gray-500 dark:text-gray-400 text-center">
+                            <Bell
+                              className="mx-auto mb-2 opacity-50"
+                              size={32}
+                            />
+                            <p>No notifications yet</p>
+                          </div>
+                        ) : (
+                          notifications.map((notification) => (
+                            <div
+                              key={notification.id}
+                              onClick={() =>
+                                handleNotificationClick(
+                                  notification.id,
+                                  notification.title,
+                                )
+                              }
+                              className={`px-4 py-3 border-b border-gray-100 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer ${
+                                !notification.is_read
+                                  ? "bg-orange-50 dark:bg-orange-900/20"
+                                  : ""
+                              }`}
+                            >
+                              <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                                {notification.title}
+                              </div>
+                              <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                {notification.message}
+                              </div>
+                              <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                                {new Date(
+                                  notification.created_at,
+                                ).toLocaleDateString()}
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </>
+                    ) : activeNotificationTab === "returns" ? (
+                      <>
+                        <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-white dark:bg-gray-800">
+                          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+                            Return Notifications
+                          </span>
+                        </div>
+                        {returnNotifications.length === 0 ? (
+                          <div className="px-4 py-8 text-gray-500 dark:text-gray-400 text-center">
+                            <Package
+                              className="mx-auto mb-2 opacity-50"
+                              size={32}
+                            />
+                            <p>No return notifications</p>
+                          </div>
+                        ) : (
+                          returnNotifications.map((notification) => (
+                            <div
+                              key={notification.id}
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                router.push("/dashboard-request");
+                              }}
+                              className="px-4 py-3 border-b border-gray-100 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1">
+                                  <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                                    {notification.borrower_name}
+                                  </div>
+                                  <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                                    Returned:{" "}
+                                    <span className="font-medium">
+                                      {notification.equipment_name}
+                                    </span>
+                                  </div>
+                                  <div className="text-xs text-gray-500 dark:text-gray-500 mt-1">
+                                    {notification.message}
+                                  </div>
+                                  <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                                    {new Date(
+                                      notification.created_at,
+                                    ).toLocaleDateString()}
+                                  </div>
+
+                                  {/* Action Buttons - Only show if pending */}
+                                  {notification.status === "pending" && (
+                                    <div className="flex gap-2 mt-2">
+                                      <button
+                                        onClick={() =>
+                                          handleConfirmReturn(
+                                            notification.id,
+                                            notification.borrowing_id,
+                                          )
+                                        }
+                                        className="flex items-center gap-1 px-3 py-1 bg-green-500 hover:bg-green-600 text-white text-xs rounded-md transition-colors"
+                                      >
+                                        <CheckCircle size={14} />
+                                        Confirm
+                                      </button>
+                                      <button
+                                        onClick={() =>
+                                          handleRejectReturn(notification.id)
+                                        }
+                                        className="flex items-center gap-1 px-3 py-1 bg-red-500 hover:bg-red-600 text-white text-xs rounded-md transition-colors"
+                                      >
+                                        <XCircle size={14} />
+                                        Reject
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                                <span
+                                  className={`text-xs px-2 py-1 rounded-full ${
+                                    notification.status === "pending"
+                                      ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400"
+                                      : "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400"
+                                  }`}
+                                >
+                                  {notification.status}
+                                </span>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                        {returnNotifications.length > 0 && (
+                          <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/50 text-center">
+                            <button
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                router.push("/dashboard-request");
+                              }}
+                              className="text-sm text-orange-600 dark:text-orange-400 hover:text-orange-700 dark:hover:text-orange-300 font-medium"
+                            >
+                              View All Returns →
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : activeNotificationTab === "done" ? (
+                      <>
+                        <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-white dark:bg-gray-800">
+                          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+                            Done Notifications
+                          </span>
+                        </div>
+                        {doneNotifications.length === 0 ? (
+                          <div className="px-4 py-8 text-gray-500 dark:text-gray-400 text-center">
+                            <LayoutDashboard
+                              className="mx-auto mb-2 opacity-50"
+                              size={32}
+                            />
+                            <p>No done notifications</p>
+                          </div>
+                        ) : (
+                          doneNotifications.map((notification) => (
+                            <div
+                              key={notification.id}
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                router.push("/dashboard-request");
+                              }}
+                              className="px-4 py-3 border-b border-gray-100 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1">
+                                  <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                                    {notification.booker_name}
+                                  </div>
+                                  <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                                    Facility:{" "}
+                                    <span className="font-medium">
+                                      {notification.facility_name}
+                                    </span>
+                                  </div>
+                                  <div className="text-xs text-gray-500 dark:text-gray-500 mt-1">
+                                    {notification.message}
+                                  </div>
+                                  <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                                    {new Date(
+                                      notification.created_at,
+                                    ).toLocaleDateString()}
+                                  </div>
+
+                                  {/* Action Buttons - Only show if pending */}
+                                  {notification.status === "pending" && (
+                                    <div className="flex gap-2 mt-2">
+                                      <button
+                                        onClick={() =>
+                                          handleConfirmDone(
+                                            notification.id,
+                                            notification.booking_id,
+                                          )
+                                        }
+                                        className="flex items-center gap-1 px-3 py-1 bg-green-500 hover:bg-green-600 text-white text-xs rounded-md transition-colors"
+                                      >
+                                        <CheckCircle size={14} />
+                                        Confirm
+                                      </button>
+                                      <button
+                                        onClick={() =>
+                                          handleDismissDone(notification.id)
+                                        }
+                                        className="flex items-center gap-1 px-3 py-1 bg-gray-500 hover:bg-gray-600 text-white text-xs rounded-md transition-colors"
+                                      >
+                                        <XCircle size={14} />
+                                        Dismiss
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                                <span
+                                  className={`text-xs px-2 py-1 rounded-full ${
+                                    notification.status === "pending"
+                                      ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400"
+                                      : "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400"
+                                  }`}
+                                >
+                                  {notification.status}
+                                </span>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                        {doneNotifications.length > 0 && (
+                          <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/50 text-center">
+                            <button
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                router.push("/dashboard-request");
+                              }}
+                              className="text-sm text-orange-600 dark:text-orange-400 hover:text-orange-700 dark:hover:text-orange-300 font-medium"
+                            >
+                              View All Done →
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : activeNotificationTab === "requests" ? (
+                      <>
+                        <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 sticky top-0 bg-white dark:bg-gray-800">
+                          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200">
+                            New Requests
+                          </span>
+                        </div>
+                        {requestNotifications.length === 0 ? (
+                          <div className="px-4 py-8 text-gray-500 dark:text-gray-400 text-center">
+                            <ClipboardList
+                              className="mx-auto mb-2 opacity-50"
+                              size={32}
+                            />
+                            <p>No pending requests</p>
+                          </div>
+                        ) : (
+                          requestNotifications.map((notification) => (
+                            <div
+                              key={`${notification.request_type}-${notification.id}`}
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                // Navigate to the correct tab based on request type
+                                router.push(
+                                  `/dashboard-request?tab=${notification.request_type}`,
+                                );
+                              }}
+                              className="px-4 py-3 border-b border-gray-100 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1">
+                                  <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                                    {notification.requester_name}
+                                  </div>
+                                  <div className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                                    {notification.request_type === "borrowing"
+                                      ? "Equipment: "
+                                      : notification.request_type === "booking"
+                                        ? "Facility: "
+                                        : "Supply: "}
+                                    <span className="font-medium">
+                                      {notification.item_name}
+                                    </span>
+                                  </div>
+                                  <div className="text-xs text-gray-500 dark:text-gray-500 mt-1">
+                                    Purpose: {notification.purpose}
+                                  </div>
+                                  <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                                    {new Date(
+                                      notification.created_at,
+                                    ).toLocaleDateString()}
+                                  </div>
+                                </div>
+                                <div className="flex flex-col items-end gap-1">
+                                  <span
+                                    className={`text-xs px-2 py-1 rounded-full ${
+                                      notification.request_type === "borrowing"
+                                        ? "bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400"
+                                        : notification.request_type ===
+                                            "booking"
+                                          ? "bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400"
+                                          : "bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400"
+                                    }`}
+                                  >
+                                    {notification.request_type}
+                                  </span>
+                                  <span className="text-xs px-2 py-1 rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400">
+                                    {notification.status}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                        {requestNotifications.length > 0 && (
+                          <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/50 text-center">
+                            <button
+                              onClick={() => {
+                                setIsNotificationDropdownOpen(false);
+                                router.push("/dashboard-request");
+                              }}
+                              className="text-sm text-orange-600 dark:text-orange-400 hover:text-orange-700 dark:hover:text-orange-300 font-medium"
+                            >
+                              View All Requests →
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          <Link href="/login">
+            <button className="bg-orange-500 hover:bg-orange-600 cursor-pointer text-white px-4 py-2 rounded-md transition-colors duration-300">
+              Sign In
+            </button>
+          </Link>
+        )}
+      </div>
+
+      {/* Mobile Menu Button */}
+      <button
+        className="md:hidden text-gray-600 dark:text-gray-400"
+        onClick={toggleMenu}
+        aria-label="Toggle menu"
+      >
+        {isOpen ? <X size={24} /> : <Menu size={24} />}
+      </button>
+
+      {/* Mobile Menu */}
+      {isOpen && (
+        <div className="absolute top-16 left-0 w-full bg-white dark:bg-gray-800 shadow-md flex flex-col items-start px-6 py-4 md:hidden z-50">
+          {isAuthenticated && user ? (
+            <>
+              {/* Notification Section for Mobile */}
+              <div className="relative dropdown-container w-full mb-4">
+                <button
+                  onClick={toggleNotificationDropdown}
+                  className="relative flex items-center py-2 text-gray-700 dark:text-gray-300"
+                >
+                  <Bell size={20} className="mr-2" />
+                  Notifications
+                  {unreadCount > 0 && (
+                    <span className="ml-2 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+                      {unreadCount > 99 ? "99+" : unreadCount}
+                    </span>
+                  )}
+                </button>
+
+                {isNotificationDropdownOpen && (
+                  <div className="mt-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg min-w-[280px] max-h-[300px] overflow-y-auto">
+                    <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700 font-semibold text-gray-800 dark:text-gray-200 flex justify-between items-center">
+                      <span>Notifications</span>
+                      {notifications.length > 0 && (
+                        <button
+                          onClick={clearAllNotifications}
+                          className="text-xs text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 hover:underline"
+                        >
+                          Clear All
+                        </button>
+                      )}
+                    </div>
+                    {notifications.length === 0 ? (
+                      <div className="px-4 py-3 text-gray-500 dark:text-gray-400 text-center">
+                        No notifications yet
+                      </div>
+                    ) : (
+                      notifications.map((notification) => (
+                        <div
+                          key={notification.id}
+                          onClick={() =>
+                            markNotificationAsRead(notification.id)
+                          }
+                          className={`px-4 py-3 border-b border-gray-100 dark:border-gray-700 cursor-pointer ${
+                            !notification.is_read
+                              ? "bg-orange-50 dark:bg-orange-900/20"
+                              : ""
+                          }`}
+                        >
+                          <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                            {notification.title}
+                          </div>
+                          <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                            {notification.message}
+                          </div>
+                          <div className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                            {new Date(
+                              notification.created_at,
+                            ).toLocaleDateString()}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* User Avatar for Mobile */}
+              <div className="relative dropdown-container w-full mt-2">
+                <button
+                  onClick={toggleAvatarDropdown}
+                  className="w-10 h-10 flex items-center justify-center cursor-pointer bg-orange-500 hover:bg-orange-600 text-white font-semibold rounded-full shadow transition"
+                >
+                  {getInitial()}
+                </button>
+
+                {isAvatarDropdownOpen && (
+                  <div className="absolute top-full left-0 mt-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg min-w-[180px] z-50">
+                    <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Palette size={16} />
+                        <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                          Theme
+                        </span>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleThemeChange("light")}
+                          className={`px-3 py-1 text-xs rounded ${
+                            theme === "light"
+                              ? "bg-orange-500 text-white"
+                              : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                          } transition`}
+                        >
+                          Light
+                        </button>
+                        <button
+                          onClick={() => handleThemeChange("dark")}
+                          className={`px-3 py-1 text-xs rounded ${
+                            theme === "dark"
+                              ? "bg-orange-500 text-white"
+                              : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                          } transition`}
+                        >
+                          Dark
+                        </button>
+                        <button
+                          onClick={() => handleThemeChange("system")}
+                          className={`px-3 py-1 text-xs rounded ${
+                            theme === "system"
+                              ? "bg-orange-500 text-white"
+                              : "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+                          } transition`}
+                        >
+                          System
+                        </button>
+                      </div>
+                    </div>
+                    <Link
+                      href="/"
+                      className="flex items-center gap-2 px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                    >
+                      <Home size={16} />
+                      Back to Home
+                    </Link>
+                    <hr className="border-gray-200 dark:border-gray-700" />
+                    <Link
+                      href="/dashboard"
+                      className="flex items-center gap-2 px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                    >
+                      <LayoutDashboard size={16} />
+                      My Dashboard
+                    </Link>
+                    <Link
+                      href="/profile"
+                      className="flex items-center gap-2 px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                    >
+                      <User size={16} />
+                      My Profile
+                    </Link>
+                    <hr className="border-gray-200 dark:border-gray-700" />
+                    <button
+                      onClick={() => {
+                        handleLogout();
+                        setIsOpen(false);
+                      }}
+                      className="flex items-center cursor-pointer gap-2 w-full text-left px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 hover:text-black dark:hover:text-white transition"
+                    >
+                      <LogOut size={16} />
+                      Logout
+                    </button>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <Link href="/login" className="w-full mt-2">
+              <button className="bg-orange-500 hover:bg-orange-600 text-white px-4 py-2 rounded-md w-full transition">
+                Sign In
+              </button>
+            </Link>
+          )}
+        </div>
+      )}
+    </nav>
+  );
+};
+
+export default DashboardNavbar;

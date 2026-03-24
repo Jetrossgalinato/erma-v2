@@ -1,0 +1,673 @@
+from fastapi import APIRouter, Depends, HTTPException, Header, UploadFile, File, Form, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete, func, or_
+from database import get_db, Facility, FacilityLog, User, Booking
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+from jose import JWTError, jwt
+from api.auth_utils import SECRET_KEY, ALGORITHM, get_philippine_time
+import os
+import uuid
+import math
+import re
+
+router = APIRouter()
+
+# Authentication dependency
+async def verify_token(authorization: Optional[str] = Header(None)):
+    """Verify JWT token from Authorization header"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return {"email": email}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+# Pydantic models
+class FacilityCreate(BaseModel):
+    facility_name: str
+    facility_type: str
+    floor_level: str
+    capacity: Optional[int] = None
+    connection_type: Optional[str] = None
+    cooling_tools: Optional[str] = None
+    building: Optional[str] = None
+    description: Optional[str] = None
+    remarks: Optional[str] = None
+    status: str = "Available"
+
+class FacilityUpdate(BaseModel):
+    facility_name: Optional[str] = None
+    facility_type: Optional[str] = None
+    floor_level: Optional[str] = None
+    capacity: Optional[int] = None
+    connection_type: Optional[str] = None
+    cooling_tools: Optional[str] = None
+    building: Optional[str] = None
+    description: Optional[str] = None
+    remarks: Optional[str] = None
+    status: Optional[str] = None
+
+class BulkDeleteRequest(BaseModel):
+    facility_ids: List[int]
+
+class FacilityLogCreate(BaseModel):
+    log_message: str
+    facility_id: Optional[int] = None
+    action: Optional[str] = None
+    details: Optional[str] = None
+
+# Ensure upload directory exists
+UPLOAD_DIR = "uploads/facility-images"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Helper function to save uploaded file
+async def save_upload_file(upload_file: UploadFile) -> str:
+    """Save uploaded file and return the URL path"""
+    # Validate file type
+    allowed_types = ["image/png", "image/jpeg", "image/jpg"]
+    if upload_file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only PNG and JPEG images are allowed")
+    
+    # Validate file size (max 5MB)
+    contents = await upload_file.read()
+    if len(contents) > 5 * 1024 * 1024:  # 5MB
+        raise HTTPException(status_code=400, detail="File size must not exceed 5MB")
+    
+    # Generate unique filename
+    file_extension = upload_file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_extension}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    # Save file
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    
+    # Return URL path
+    return f"/uploads/facility-images/{unique_filename}"
+
+@router.get("/facilities/all")
+async def get_all_facilities(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Get all facilities for dashboard management"""
+    try:
+        result = await db.execute(select(Facility))
+        facilities = result.scalars().all()
+        
+        facilities_list = []
+        for facility in facilities:
+            facilities_list.append({
+                "facility_id": facility.facility_id,
+                "facility_name": facility.facility_name,
+                "facility_type": facility.facility_type,
+                "floor_level": facility.floor_level,
+                "capacity": facility.capacity,
+                "connection_type": facility.connection_type,
+                "cooling_tools": facility.cooling_tools,
+                "building": facility.building,
+                "description": facility.description,
+                "remarks": facility.remarks,
+                "status": facility.status,
+                "image_url": facility.image_url,
+                "created_at": facility.created_at.isoformat() if facility.created_at else None,
+                "updated_at": facility.updated_at.isoformat() if facility.updated_at else None
+            })
+        
+        return {"facilities": facilities_list}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching facilities: {str(e)}")
+
+@router.get("/facilities/{facility_id}/history")
+async def get_facility_history(
+    facility_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Get booking history for a specific facility
+    """
+    try:
+        # Join with User to get booker name
+        query = (
+            select(Booking, User)
+            .join(User, Booking.bookers_id == User.id)
+            .where(
+                Booking.facility_id == facility_id,
+                Booking.request_type == 'Facility'
+            )
+            .order_by(Booking.created_at.desc())
+        )
+        
+        result = await db.execute(query)
+        bookings = result.all()
+        
+        return [
+            {
+                "id": booking.id,
+                "borrower_name": f"{user.first_name} {user.last_name}",
+                "purpose": booking.purpose,
+                "start_date": booking.start_date,
+                "end_date": booking.end_date,
+                "return_date": booking.return_date if booking.status == "Released" else None, # Facility doesn't really have "Return", but maybe "Released" or "Done"
+                "request_status": booking.status,
+                "return_status": "Released" if booking.status == "Released" else "-", # Mapping similar concept
+                "created_at": booking.created_at.isoformat() if booking.created_at else None,
+            }
+            for booking, user in bookings
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching facility history: {str(e)}")
+
+@router.post("/facilities")
+async def create_facility_json(
+    facility_data: FacilityCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Create a new facility with JSON data (no image upload)"""
+    try:
+        # Create new facility
+        new_facility = Facility(
+            facility_name=facility_data.facility_name,
+            facility_type=facility_data.facility_type,
+            floor_level=facility_data.floor_level,
+            capacity=facility_data.capacity,
+            connection_type=facility_data.connection_type,
+            cooling_tools=facility_data.cooling_tools,
+            building=facility_data.building,
+            description=facility_data.description,
+            remarks=facility_data.remarks,
+            status=facility_data.status,
+            created_at=get_philippine_time()
+        )
+        
+        db.add(new_facility)
+        await db.commit()
+        await db.refresh(new_facility)
+        
+        return {
+            "message": "Facility created successfully",
+            "facility": {
+                "facility_id": new_facility.facility_id,
+                "facility_name": new_facility.facility_name,
+                "facility_type": new_facility.facility_type,
+                "floor_level": new_facility.floor_level,
+                "capacity": new_facility.capacity,
+                "connection_type": new_facility.connection_type,
+                "cooling_tools": new_facility.cooling_tools,
+                "building": new_facility.building,
+                "description": new_facility.description,
+                "remarks": new_facility.remarks,
+                "status": new_facility.status,
+                "image_url": new_facility.image_url,
+                "created_at": new_facility.created_at.isoformat()
+            }
+        }
+    
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creating facility: {str(e)}")
+
+@router.post("/facilities/with-image")
+async def create_facility_with_image(
+    facility_name: str = Form(...),
+    facility_type: str = Form(...),
+    floor_level: str = Form(...),
+    capacity: Optional[int] = Form(None),
+    connection_type: Optional[str] = Form(None),
+    cooling_tools: Optional[str] = Form(None),
+    building: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    remarks: Optional[str] = Form(None),
+    status: str = Form("Available"),
+    image: Optional[UploadFile] = File(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Create a new facility with optional image upload (Form data)"""
+    try:
+        # Handle image upload
+        image_url = None
+        if image:
+            image_url = await save_upload_file(image)
+        
+        # Create new facility
+        new_facility = Facility(
+            facility_name=facility_name,
+            facility_type=facility_type,
+            floor_level=floor_level,
+            capacity=capacity,
+            connection_type=connection_type,
+            cooling_tools=cooling_tools,
+            building=building,
+            description=description,
+            remarks=remarks,
+            status=status,
+            image_url=image_url,
+            created_at=get_philippine_time()
+        )
+        
+        db.add(new_facility)
+        await db.commit()
+        await db.refresh(new_facility)
+        
+        return {
+            "message": "Facility created successfully",
+            "facility": {
+                "facility_id": new_facility.facility_id,
+                "facility_name": new_facility.facility_name,
+                "facility_type": new_facility.facility_type,
+                "floor_level": new_facility.floor_level,
+                "capacity": new_facility.capacity,
+                "connection_type": new_facility.connection_type,
+                "cooling_tools": new_facility.cooling_tools,
+                "building": new_facility.building,
+                "description": new_facility.description,
+                "remarks": new_facility.remarks,
+                "status": new_facility.status,
+                "image_url": new_facility.image_url,
+                "created_at": new_facility.created_at.isoformat()
+            }
+        }
+    
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creating facility: {str(e)}")
+
+@router.put("/facilities/{facility_id}")
+async def update_facility(
+    facility_id: int,
+    facility_name: Optional[str] = Form(None),
+    facility_type: Optional[str] = Form(None),
+    floor_level: Optional[str] = Form(None),
+    capacity: Optional[int] = Form(None),
+    connection_type: Optional[str] = Form(None),
+    cooling_tools: Optional[str] = Form(None),
+    building: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    remarks: Optional[str] = Form(None),
+    status: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Update an existing facility"""
+    try:
+        # Get facility
+        result = await db.execute(select(Facility).where(Facility.facility_id == facility_id))
+        facility = result.scalar_one_or_none()
+        
+        if not facility:
+            raise HTTPException(status_code=404, detail="Facility not found")
+        
+        # Handle image upload
+        if image:
+            # Delete old image if exists
+            if facility.image_url:
+                old_image_path = facility.image_url.replace("/uploads/facility-images/", "")
+                old_file_path = os.path.join(UPLOAD_DIR, old_image_path)
+                if os.path.exists(old_file_path):
+                    os.remove(old_file_path)
+            
+            # Save new image
+            facility.image_url = await save_upload_file(image)
+        
+        # Update fields
+        if facility_name is not None:
+            facility.facility_name = facility_name
+        if facility_type is not None:
+            facility.facility_type = facility_type
+        if floor_level is not None:
+            facility.floor_level = floor_level
+        if capacity is not None:
+            facility.capacity = capacity
+        if connection_type is not None:
+            facility.connection_type = connection_type
+        if cooling_tools is not None:
+            facility.cooling_tools = cooling_tools
+        if building is not None:
+            facility.building = building
+        if description is not None:
+            facility.description = description
+        if remarks is not None:
+            facility.remarks = remarks
+        if status is not None:
+            facility.status = status
+        
+        facility.updated_at = get_philippine_time()
+        
+        await db.commit()
+        await db.refresh(facility)
+        
+        return {
+            "message": "Facility updated successfully",
+            "facility": {
+                "facility_id": facility.facility_id,
+                "facility_name": facility.facility_name,
+                "facility_type": facility.facility_type,
+                "floor_level": facility.floor_level,
+                "capacity": facility.capacity,
+                "connection_type": facility.connection_type,
+                "cooling_tools": facility.cooling_tools,
+                "building": facility.building,
+                "description": facility.description,
+                "remarks": facility.remarks,
+                "status": facility.status,
+                "image_url": facility.image_url,
+                "updated_at": facility.updated_at.isoformat() if facility.updated_at else None
+            }
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error updating facility: {str(e)}")
+
+@router.delete("/facilities/bulk-delete")
+@router.post("/facilities/bulk-delete")
+async def bulk_delete_facilities(
+    request: BulkDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Delete multiple facilities (supports both DELETE and POST methods)"""
+    try:
+        if not request.facility_ids:
+            raise HTTPException(status_code=400, detail="No facility IDs provided")
+        
+        # Get facilities to delete
+        result = await db.execute(
+            select(Facility).where(Facility.facility_id.in_(request.facility_ids))
+        )
+        facilities = result.scalars().all()
+        
+        # Delete associated images
+        for facility in facilities:
+            if facility.image_url:
+                image_path = facility.image_url.replace("/uploads/facility-images/", "")
+                file_path = os.path.join(UPLOAD_DIR, image_path)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        
+        # Delete facilities
+        await db.execute(
+            delete(Facility).where(Facility.facility_id.in_(request.facility_ids))
+        )
+        await db.commit()
+        
+        return {
+            "message": f"Successfully deleted {len(facilities)} facilities",
+            "deleted_count": len(facilities)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error deleting facilities: {str(e)}")
+
+@router.delete("/facilities/{facility_id}")
+async def delete_facility(
+    facility_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Delete a single facility"""
+    try:
+        # Get facility
+        result = await db.execute(select(Facility).where(Facility.facility_id == facility_id))
+        facility = result.scalar_one_or_none()
+        
+        if not facility:
+            raise HTTPException(status_code=404, detail="Facility not found")
+        
+        # Delete image if exists
+        if facility.image_url:
+            image_path = facility.image_url.replace("/uploads/facility-images/", "")
+            file_path = os.path.join(UPLOAD_DIR, image_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        
+        # Delete facility
+        await db.delete(facility)
+        await db.commit()
+        
+        return {"message": "Facility deleted successfully"}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error deleting facility: {str(e)}")
+
+@router.post("/facilities/bulk-import")
+async def bulk_import_facilities(
+    facilities_data: List[FacilityCreate],
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """Import multiple facilities at once"""
+    try:
+        created_facilities = []
+        
+        for facility_data in facilities_data:
+            new_facility = Facility(
+                facility_name=facility_data.facility_name,
+                facility_type=facility_data.facility_type,
+                floor_level=facility_data.floor_level,
+                capacity=facility_data.capacity,
+                connection_type=facility_data.connection_type,
+                cooling_tools=facility_data.cooling_tools,
+                building=facility_data.building,
+                description=facility_data.description,
+                remarks=facility_data.remarks,
+                status=facility_data.status,
+                created_at=get_philippine_time()
+            )
+            
+            db.add(new_facility)
+            created_facilities.append(new_facility)
+        
+        await db.commit()
+        
+        # Refresh all created facilities
+        for facility in created_facilities:
+            await db.refresh(facility)
+        
+        return {
+            "message": f"Successfully imported {len(created_facilities)} facilities",
+            "imported_count": len(created_facilities),
+            "facilities": [
+                {
+                    "facility_id": f.facility_id,
+                    "facility_name": f.facility_name,
+                    "facility_type": f.facility_type,
+                    "status": f.status
+                }
+                for f in created_facilities
+            ]
+        }
+    
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error importing facilities: {str(e)}")
+
+@router.post("/facility-logs")
+async def create_facility_log(
+    log_data: FacilityLogCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Create a facility log entry
+    """
+    try:
+        # Determine action from log_message or use provided action
+        action = log_data.action or "action"
+        if log_data.log_message:
+            # Extract action from log message (first word usually)
+            action_words = log_data.log_message.lower().split()
+            if action_words:
+                if "added" in action_words or "created" in action_words:
+                    action = "created"
+                elif "updated" in action_words or "edited" in action_words:
+                    action = "updated"
+                elif "deleted" in action_words or "removed" in action_words:
+                    action = "deleted"
+                else:
+                    action = action_words[0]
+        
+        new_log = FacilityLog(
+            facility_id=log_data.facility_id,
+            action=action,
+            details=log_data.details or log_data.log_message,
+            user_email=current_user["email"],
+            created_at=get_philippine_time()
+        )
+        
+        db.add(new_log)
+        await db.commit()
+        await db.refresh(new_log)
+        
+        return {
+            "message": "Facility log created successfully",
+            "log_id": new_log.id
+        }
+    
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creating facility log: {str(e)}")
+
+@router.get("/facilities/logs")
+async def get_facility_logs(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=10000),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(verify_token)
+):
+    """
+    Get paginated facility logs for monitoring page
+    Returns logs with formatted log_message field for frontend display
+    """
+    try:
+        # Base conditions
+        conditions = []
+        if search:
+            search_pattern = f"%{search}%"
+            conditions.append(
+                or_(
+                    FacilityLog.action.ilike(search_pattern),
+                    FacilityLog.details.ilike(search_pattern),
+                    FacilityLog.user_email.ilike(search_pattern),
+                    Facility.facility_name.ilike(search_pattern),
+                    User.first_name.ilike(search_pattern),
+                    User.last_name.ilike(search_pattern)
+                )
+            )
+
+        # Get total count
+        count_query = select(func.count(FacilityLog.id))
+        if search:
+             count_query = count_query.outerjoin(Facility, FacilityLog.facility_id == Facility.facility_id)
+             count_query = count_query.outerjoin(User, FacilityLog.user_email == User.email)
+             for condition in conditions:
+                 count_query = count_query.where(condition)
+
+        count_result = await db.execute(count_query)
+        total_count = count_result.scalar() or 0
+        
+        # Calculate pagination
+        total_pages = math.ceil(total_count / limit) if total_count > 0 else 1
+        offset = (page - 1) * limit
+        
+        # Get logs with pagination
+        query = select(FacilityLog)
+        if search:
+            query = query.outerjoin(Facility, FacilityLog.facility_id == Facility.facility_id)
+            query = query.outerjoin(User, FacilityLog.user_email == User.email)
+            for condition in conditions:
+                query = query.where(condition)
+
+        query = (
+            query
+            .order_by(FacilityLog.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        
+        result = await db.execute(query)
+        logs = result.scalars().all()
+        
+        # Format response with log_message field
+        logs_data = []
+        for log in logs:
+            # Get facility name if facility_id exists
+            facility_name = "Facility"
+            if log.facility_id:
+                facility_result = await db.execute(
+                    select(Facility).where(Facility.facility_id == log.facility_id)
+                )
+                facility = facility_result.scalar_one_or_none()
+                if facility:
+                    facility_name = facility.facility_name
+            
+            # Construct log_message based on action and details
+            
+            # Get admin user info
+            admin_user = None
+            if log.user_email:
+                admin_result = await db.execute(
+                    select(User).where(User.email == log.user_email)
+                )
+                admin_user = admin_result.scalar_one_or_none()
+            
+            user_identifier = f"{admin_user.first_name} {admin_user.last_name}" if admin_user else (log.user_email.split("@")[0] if log.user_email else "User")
+            
+            # If details already contains a complete message, use it directly
+            # Otherwise format it with action and facility name
+            if log.details and any(keyword in log.details.lower() for keyword in ["created", "updated", "deleted", "approved", "rejected", "completed", "confirmed", "dismissed"]):
+                # Details already contains full message like "created facility 'Cl1'" or "Booking request approved for Facility A"
+                # Remove ID references from details to make it clearer for users
+                clean_details = re.sub(r'\s*ID\s*\d+', '', log.details)
+                log_message = f"Admin {user_identifier} {clean_details}"
+            elif log.details:
+                # Remove ID references from details to make it clearer for users
+                clean_details = re.sub(r'\s*ID\s*\d+', '', log.details)
+                log_message = f"Admin {user_identifier} {log.action} for {facility_name} - {clean_details}"
+            else:
+                log_message = f"Admin {user_identifier} {log.action} for {facility_name}"
+            
+            logs_data.append({
+                "id": log.id,
+                "log_message": log_message,
+                "created_at": log.created_at.isoformat() if log.created_at else None
+            })
+        
+        return {
+            "logs": logs_data,
+            "total_count": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching facility logs: {str(e)}")

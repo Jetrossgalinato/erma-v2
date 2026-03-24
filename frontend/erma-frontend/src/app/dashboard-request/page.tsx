@@ -1,0 +1,748 @@
+"use client";
+
+import { useEffect, useState, useCallback, Suspense, useRef } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import DashboardNavbar from "@/components/DashboardNavbar";
+import Sidebar from "@/components/Sidebar";
+import Loader from "@/components/Loader";
+import { useAuthStore } from "@/store";
+import { useDashboardRequestsStore } from "@/store";
+import { useAlert } from "@/contexts/AlertContext";
+import { mapRoleToSystemRole } from "@/../lib/roleUtils";
+import RequestTypeSelector from "./components/RequestTypeSelector";
+import BorrowingRequestsTable from "./components/BorrowingRequestsTable";
+import BookingRequestsTable from "./components/BookingRequestsTable";
+import AcquiringRequestsTable from "./components/AcquiringRequestsTable";
+import ActionButtons from "./components/ActionButtons";
+import ReturnNotificationsModal from "./components/ReturnNotificationsModal";
+import DoneNotificationsModal from "./components/DoneNotificationsModal";
+import EmptyState from "./components/EmptyState";
+import Pagination from "./components/Pagination";
+import DeleteConfirmationModal from "@/components/DeleteConfirmationModal";
+import { Package, LayoutDashboard } from "lucide-react";
+import { API_BASE_URL } from "@/utils/api";
+import {
+  BorrowingRequest,
+  BookingRequest,
+  AcquiringRequest,
+  ReturnNotification,
+  DoneNotification,
+  fetchBorrowingRequests,
+  fetchBookingRequests,
+  fetchAcquiringRequests,
+  fetchReturnNotifications,
+  fetchDoneNotifications,
+  bulkUpdateBorrowingStatus,
+  bulkUpdateBookingStatus,
+  bulkUpdateAcquiringStatus,
+  bulkDeleteBorrowingRequests,
+  bulkDeleteBookingRequests,
+  bulkDeleteAcquiringRequests,
+} from "./utils/helpers";
+
+const PAGE_SIZE = 10;
+
+function DashboardRequestsContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const { isAuthenticated, isLoading: authLoading, user } = useAuthStore();
+  const { showAlert } = useAlert();
+  const {
+    currentRequestType,
+    isLoading,
+    selectedIds,
+    showActionDropdown,
+    currentPage,
+    totalPages,
+    setCurrentRequestType,
+    setIsLoading,
+    clearSelection,
+    selectAll,
+    toggleSelection,
+    setShowActionDropdown,
+    setCurrentPage,
+    setTotalPages,
+  } = useDashboardRequestsStore();
+
+  const [borrowingRequests, setBorrowingRequests] = useState<
+    BorrowingRequest[]
+  >([]);
+  const [bookingRequests, setBookingRequests] = useState<BookingRequest[]>([]);
+  const [acquiringRequests, setAcquiringRequests] = useState<
+    AcquiringRequest[]
+  >([]);
+  const [returnNotifications, setReturnNotifications] = useState<
+    ReturnNotification[]
+  >([]);
+  const [doneNotifications, setDoneNotifications] = useState<
+    DoneNotification[]
+  >([]);
+  const [showReturnModal, setShowReturnModal] = useState(false);
+  const [showDoneModal, setShowDoneModal] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [showTypeDropdown, setShowTypeDropdown] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [totalCount, setTotalCount] = useState(0);
+
+  // Role-based access control - Faculty users should not access dashboard requests
+  useEffect(() => {
+    if (!authLoading) {
+      if (!isAuthenticated) {
+        router.push("/login");
+        return;
+      }
+
+      const userRole = user?.role;
+      const mappedRole = userRole ? mapRoleToSystemRole(userRole) : null;
+      if (mappedRole === "Faculty") {
+        router.push("/");
+        return;
+      }
+    }
+  }, [authLoading, isAuthenticated, user, router]);
+
+  // Handle tab parameter from URL
+  useEffect(() => {
+    const tab = searchParams.get("tab");
+    if (tab && ["borrowing", "booking", "acquiring"].includes(tab)) {
+      setCurrentRequestType(tab as "borrowing" | "booking" | "acquiring");
+    }
+  }, [searchParams, setCurrentRequestType]);
+
+  // Load data function
+  const loadData = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      if (currentRequestType === "borrowing") {
+        const data = await fetchBorrowingRequests(currentPage, PAGE_SIZE);
+        // Deduplicate data by ID to prevent key errors
+        const uniqueData = Array.from(
+          new Map(data.data.map((item) => [item.id, item])).values(),
+        );
+        setBorrowingRequests(uniqueData);
+        setTotalPages(data.total_pages);
+        setTotalCount(data.total);
+      } else if (currentRequestType === "booking") {
+        const data = await fetchBookingRequests(currentPage, PAGE_SIZE);
+        // Deduplicate data by ID
+        const uniqueData = Array.from(
+          new Map(data.data.map((item) => [item.id, item])).values(),
+        );
+        setBookingRequests(uniqueData);
+        setTotalPages(data.total_pages);
+        setTotalCount(data.total);
+      } else if (currentRequestType === "acquiring") {
+        const data = await fetchAcquiringRequests(currentPage, PAGE_SIZE);
+        // Deduplicate data by ID
+        const uniqueData = Array.from(
+          new Map(data.data.map((item) => [item.id, item])).values(),
+        );
+        setAcquiringRequests(uniqueData);
+        setTotalPages(data.total_pages);
+        setTotalCount(data.total);
+      }
+    } catch (err) {
+      setError("Failed to load requests");
+      console.error("Error loading data:", err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [
+    currentRequestType,
+    currentPage,
+    setIsLoading,
+    setTotalPages,
+    setTotalCount,
+  ]);
+
+  // Keep the WS connection stable while still reacting to state changes.
+  const loadDataRef = useRef(loadData);
+  const requestTypeRef = useRef(currentRequestType);
+  const isLoadingRef = useRef(isLoading);
+  const pendingRequestsFingerprintRef = useRef<string>("");
+  const pendingRefreshAfterLoadRef = useRef(false);
+
+  useEffect(() => {
+    loadDataRef.current = loadData;
+  }, [loadData]);
+
+  useEffect(() => {
+    requestTypeRef.current = currentRequestType;
+  }, [currentRequestType]);
+
+  useEffect(() => {
+    isLoadingRef.current = isLoading;
+  }, [isLoading]);
+
+  useEffect(() => {
+    if (!isLoading && pendingRefreshAfterLoadRef.current) {
+      pendingRefreshAfterLoadRef.current = false;
+      void loadData();
+    }
+  }, [isLoading, loadData]);
+
+  // Load notifications
+  const loadNotifications = useCallback(async () => {
+    try {
+      const [returnData, doneData] = await Promise.all([
+        fetchReturnNotifications(),
+        fetchDoneNotifications(),
+      ]);
+      setReturnNotifications(returnData || []);
+      setDoneNotifications(doneData || []);
+    } catch (err) {
+      console.error("Error loading notifications:", err);
+    }
+  }, []);
+
+  // Handle opening return notifications modal
+  const handleShowReturnNotifications = async () => {
+    await loadNotifications();
+    setShowReturnModal(true);
+  };
+
+  // Handle opening done notifications modal
+  const handleShowDoneNotifications = async () => {
+    await loadNotifications();
+    setShowDoneModal(true);
+  };
+
+  // Bulk approve
+  const handleBulkApprove = async () => {
+    if (selectedIds.length === 0) return;
+
+    try {
+      setIsLoading(true);
+      let success = false;
+
+      if (currentRequestType === "borrowing") {
+        success = await bulkUpdateBorrowingStatus(selectedIds, "Approved");
+      } else if (currentRequestType === "booking") {
+        success = await bulkUpdateBookingStatus(selectedIds, "Approved");
+      } else if (currentRequestType === "acquiring") {
+        success = await bulkUpdateAcquiringStatus(selectedIds, "Approved");
+      }
+
+      if (success) {
+        showAlert({
+          type: "success",
+          message: `Successfully approved ${selectedIds.length} request(s)`,
+        });
+        clearSelection();
+        setShowActionDropdown(false);
+        await loadData();
+      }
+    } catch (error) {
+      console.error("Error approving requests:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Bulk reject
+  const handleBulkReject = async () => {
+    if (selectedIds.length === 0) return;
+
+    try {
+      setIsLoading(true);
+      let success = false;
+
+      if (currentRequestType === "borrowing") {
+        success = await bulkUpdateBorrowingStatus(selectedIds, "Rejected");
+      } else if (currentRequestType === "booking") {
+        success = await bulkUpdateBookingStatus(selectedIds, "Rejected");
+      } else if (currentRequestType === "acquiring") {
+        success = await bulkUpdateAcquiringStatus(selectedIds, "Rejected");
+      }
+
+      if (success) {
+        showAlert({
+          type: "success",
+          message: `Successfully rejected ${selectedIds.length} request(s)`,
+        });
+        clearSelection();
+        setShowActionDropdown(false);
+        await loadData();
+      }
+    } catch (error) {
+      console.error("Error rejecting requests:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Bulk delete
+  const handleBulkDelete = () => {
+    if (selectedIds.length === 0) return;
+    setShowDeleteModal(true);
+  };
+
+  const confirmBulkDelete = async () => {
+    try {
+      setIsLoading(true);
+      let success = false;
+
+      if (currentRequestType === "borrowing") {
+        success = await bulkDeleteBorrowingRequests(selectedIds);
+      } else if (currentRequestType === "booking") {
+        success = await bulkDeleteBookingRequests(selectedIds);
+      } else if (currentRequestType === "acquiring") {
+        success = await bulkDeleteAcquiringRequests(selectedIds);
+      }
+
+      if (success) {
+        showAlert({
+          type: "success",
+          message: `Successfully deleted ${selectedIds.length} request(s)`,
+        });
+        clearSelection();
+        setShowActionDropdown(false);
+        setShowDeleteModal(false);
+        await loadData();
+      }
+    } catch (error) {
+      console.error("Error deleting requests:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Get current requests based on type
+  const currentRequests =
+    currentRequestType === "borrowing"
+      ? borrowingRequests
+      : currentRequestType === "booking"
+        ? bookingRequests
+        : acquiringRequests;
+
+  const totalItems = totalCount;
+
+  // Check if approve should be disabled (already approved or rejected)
+  const disableApprove =
+    (currentRequestType === "borrowing" &&
+      selectedIds.some((id) => {
+        const request = borrowingRequests.find((r) => r.id === id);
+        return (
+          request?.request_status === "Approved" ||
+          request?.request_status === "Rejected"
+        );
+      })) ||
+    (currentRequestType === "booking" &&
+      selectedIds.some((id) => {
+        const request = bookingRequests.find((r) => r.id === id);
+        return (
+          request?.status === "Approved" ||
+          request?.status === "Rejected" ||
+          request?.status === "Completed"
+        );
+      })) ||
+    (currentRequestType === "acquiring" &&
+      selectedIds.some((id) => {
+        const request = acquiringRequests.find((r) => r.id === id);
+        return request?.status === "Approved" || request?.status === "Rejected";
+      }));
+
+  // Check if reject should be disabled (already approved or rejected)
+  const disableReject =
+    (currentRequestType === "borrowing" &&
+      selectedIds.some((id) => {
+        const request = borrowingRequests.find((r) => r.id === id);
+        return (
+          request?.request_status === "Approved" ||
+          request?.request_status === "Rejected"
+        );
+      })) ||
+    (currentRequestType === "booking" &&
+      selectedIds.some((id) => {
+        const request = bookingRequests.find((r) => r.id === id);
+        return (
+          request?.status === "Approved" ||
+          request?.status === "Rejected" ||
+          request?.status === "Completed"
+        );
+      })) ||
+    (currentRequestType === "acquiring" &&
+      selectedIds.some((id) => {
+        const request = acquiringRequests.find((r) => r.id === id);
+        return request?.status === "Approved" || request?.status === "Rejected";
+      }));
+
+  // Load initial data - Use Promise.all for parallel fetching (50% faster)
+  useEffect(() => {
+    if (isAuthenticated) {
+      // Parallel data fetching instead of sequential
+      Promise.all([loadData(), loadNotifications()]).catch((error) => {
+        console.error("Error loading initial data:", error);
+      });
+    }
+  }, [
+    currentRequestType,
+    currentPage,
+    isAuthenticated,
+    loadData,
+    loadNotifications,
+  ]);
+
+  // Set up WebSocket for real-time notifications
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    if (typeof window === "undefined") return;
+
+    const baseUrl = API_BASE_URL || "http://localhost:8000";
+    const wsUrl = (() => {
+      try {
+        const url = new URL(baseUrl);
+        const shouldUseSecureWs =
+          url.protocol === "https:" || window.location.protocol === "https:";
+        url.protocol = shouldUseSecureWs ? "wss:" : "ws:";
+        return url.toString().replace(/\/$/, "");
+      } catch {
+        return baseUrl
+          .replace(/^http(s)?/, (match, isHttps) => (isHttps ? "wss" : "ws"))
+          .replace(/\/$/, "");
+      }
+    })();
+    const looksLikeJwt = (value: string) =>
+      /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+
+    const cleanRawToken = (value: string) =>
+      value
+        .trim()
+        .replace(/^Bearer\s+/i, "")
+        .replace(/^"|"$/g, "")
+        .replace(/^'|'$/g, "");
+
+    const rawAuthToken = localStorage.getItem("authToken");
+    const rawLegacyToken = localStorage.getItem("token");
+    const cleanedAuthToken = rawAuthToken ? cleanRawToken(rawAuthToken) : null;
+    const cleanedLegacyToken = rawLegacyToken
+      ? cleanRawToken(rawLegacyToken)
+      : null;
+
+    const cleanToken =
+      (cleanedAuthToken && looksLikeJwt(cleanedAuthToken)
+        ? cleanedAuthToken
+        : null) ||
+      (cleanedLegacyToken && looksLikeJwt(cleanedLegacyToken)
+        ? cleanedLegacyToken
+        : null);
+
+    if (!cleanToken) return;
+
+    let ws: WebSocket | undefined;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let initialConnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let isActive = true;
+    let hasWarned = false;
+
+    const connectWebSocket = () => {
+      if (!isActive) return;
+
+      const wsEndpoint = `${wsUrl}/api/ws/notifications?token=${encodeURIComponent(cleanToken)}`;
+      const wsSafeEndpoint = `${wsUrl}/api/ws/notifications`;
+
+      ws = new WebSocket(wsEndpoint);
+
+      ws.onopen = () => {
+        if (process.env.NODE_ENV !== "production") {
+          // eslint-disable-next-line no-console
+          console.debug("WebSocket connected.", { endpoint: wsSafeEndpoint });
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.returnNotifications) {
+            setReturnNotifications(data.returnNotifications);
+          }
+          if (data.doneNotifications) {
+            setDoneNotifications(data.doneNotifications);
+          }
+          if (Array.isArray(data.pendingRequests)) {
+            const currentType = requestTypeRef.current;
+            const fingerprint = data.pendingRequests
+              .filter((item: any) => item?.request_type === currentType)
+              .map((item: any) => String(item?.id ?? ""))
+              .join(",");
+
+            if (fingerprint !== pendingRequestsFingerprintRef.current) {
+              pendingRequestsFingerprintRef.current = fingerprint;
+
+              // A new pending request (or one got approved/rejected) exists.
+              // Refresh the currently viewed list once so admins don't need manual refresh.
+              if (isLoadingRef.current) {
+                pendingRefreshAfterLoadRef.current = true;
+              } else {
+                void loadDataRef.current();
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Error parsing websocket message:", err);
+        }
+      };
+
+      ws.onerror = () => {
+        // Browser WebSocket error events are intentionally opaque (often `{}` in Next overlay).
+        // Avoid `console.error` to prevent noisy dev overlays; rely on `onclose` codes instead.
+        if (!hasWarned && process.env.NODE_ENV !== "production") {
+          hasWarned = true;
+          // eslint-disable-next-line no-console
+          console.debug(
+            "WebSocket error (details will appear in close event).",
+          );
+        }
+      };
+
+      ws.onclose = (event) => {
+        if (!isActive) return;
+
+        if (process.env.NODE_ENV !== "production") {
+          const isNormalClose = event.code === 1000 || event.code === 1005;
+          // eslint-disable-next-line no-console
+          (isNormalClose ? console.debug : console.warn)("WebSocket closed.", {
+            endpoint: wsSafeEndpoint,
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean,
+          });
+        }
+
+        // 1008 is what the backend uses for invalid/missing token (policy violation).
+        // Reconnecting in a tight loop just spams the console.
+        if (event.code === 1008) {
+          if (process.env.NODE_ENV !== "production") {
+            // eslint-disable-next-line no-console
+            console.warn("WebSocket closed (auth/policy). Not reconnecting.", {
+              code: event.code,
+              reason: event.reason,
+            });
+          }
+          return;
+        }
+
+        reconnectTimer = setTimeout(connectWebSocket, 5000);
+      };
+    };
+
+    // In React Strict Mode (dev), effects mount/unmount twice.
+    // Deferring the first connection avoids creating a socket that gets
+    // immediately closed during the dev-only lifecycle cycle.
+    initialConnectTimer = setTimeout(connectWebSocket, 0);
+
+    return () => {
+      isActive = false;
+      if (initialConnectTimer) clearTimeout(initialConnectTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [isAuthenticated]);
+
+  if (!isAuthenticated) {
+    return <Loader />;
+  }
+
+  return (
+    <div className="flex h-screen bg-gray-50 dark:bg-gray-900 overflow-hidden">
+      <header className="fixed top-0 left-0 right-0 z-50 h-16 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 shadow-sm">
+        <DashboardNavbar />
+      </header>
+
+      <aside className="fixed inset-y-0 left-0 z-40 w-64 transform lg:translate-x-0 lg:static lg:inset-0 lg:flex-shrink-0">
+        <div className="w-64 h-full">
+          <Sidebar />
+        </div>
+      </aside>
+
+      <div className="flex flex-col flex-1 min-w-0">
+        <main className="flex-1 relative overflow-y-auto focus:outline-none mt-16">
+          <div className="py-6">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 md:px-8">
+              {/* Header */}
+              <div className="mb-6 pt-8">
+                <div className="flex items-start justify-between mb-4">
+                  <div>
+                    <h1 className="text-3xl font-semibold text-gray-900 dark:text-gray-100 tracking-tight">
+                      Requests List
+                    </h1>
+                    <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
+                      Monitor requests for borrowing equipment, booking
+                      facilities, and acquiring supplies—all in one place.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Notification and Action Controls */}
+                <div className="flex items-center justify-between">
+                  {/* Left side - Notification Buttons */}
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                      Confirmations:
+                    </span>
+                    <button
+                      onClick={handleShowReturnNotifications}
+                      className="relative flex items-center gap-2 px-3 py-1.5 bg-orange-500 hover:bg-orange-600 text-white rounded-md transition-colors text-sm font-medium shadow-sm"
+                    >
+                      <Package size={16} />
+                      Returns
+                      {returnNotifications.length > 0 && (
+                        <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center font-bold">
+                          {returnNotifications.length > 99
+                            ? "99+"
+                            : returnNotifications.length}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      onClick={handleShowDoneNotifications}
+                      className="relative flex items-center gap-2 px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-md transition-colors text-sm font-medium shadow-sm"
+                    >
+                      <LayoutDashboard size={16} />
+                      Done
+                      {doneNotifications.length > 0 && (
+                        <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center font-bold">
+                          {doneNotifications.length > 99
+                            ? "99+"
+                            : doneNotifications.length}
+                        </span>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Right side - Action Controls */}
+                  <div className="flex items-center gap-3">
+                    <RequestTypeSelector
+                      currentType={currentRequestType}
+                      onChange={setCurrentRequestType}
+                      isOpen={showTypeDropdown}
+                      onToggle={() => {
+                        setShowTypeDropdown(!showTypeDropdown);
+                        setShowActionDropdown(false);
+                      }}
+                    />
+                    <ActionButtons
+                      selectedCount={selectedIds.length}
+                      showActionDropdown={showActionDropdown}
+                      onToggleDropdown={() => {
+                        setShowActionDropdown(!showActionDropdown);
+                        setShowTypeDropdown(false);
+                      }}
+                      onApprove={handleBulkApprove}
+                      onReject={handleBulkReject}
+                      onDelete={handleBulkDelete}
+                      onRefresh={loadData}
+                      disableApprove={disableApprove}
+                      disableReject={disableReject}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Error Message */}
+              {error && (
+                <div className="mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                  <p className="text-red-800 dark:text-red-400">{error}</p>
+                </div>
+              )}
+
+              {/* Loading State */}
+              {isLoading && <Loader fullScreen={false} className="h-64" />}
+
+              {/* Content */}
+              {!isLoading && (
+                <>
+                  {currentRequests.length === 0 ? (
+                    <EmptyState
+                      message="No requests found"
+                      description="There are no requests to display at this time."
+                    />
+                  ) : (
+                    <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+                      {currentRequestType === "borrowing" && (
+                        <BorrowingRequestsTable
+                          requests={borrowingRequests}
+                          selectedIds={selectedIds}
+                          onToggleSelection={toggleSelection}
+                          onSelectAll={selectAll}
+                        />
+                      )}
+                      {currentRequestType === "booking" && (
+                        <BookingRequestsTable
+                          requests={bookingRequests}
+                          selectedIds={selectedIds}
+                          onToggleSelection={toggleSelection}
+                          onSelectAll={selectAll}
+                        />
+                      )}
+                      {currentRequestType === "acquiring" && (
+                        <AcquiringRequestsTable
+                          requests={acquiringRequests}
+                          selectedIds={selectedIds}
+                          onToggleSelection={toggleSelection}
+                          onSelectAll={selectAll}
+                        />
+                      )}
+
+                      {/* Pagination */}
+                      <Pagination
+                        currentPage={currentPage}
+                        totalPages={totalPages}
+                        onPageChange={setCurrentPage}
+                        totalItems={totalItems}
+                        itemsPerPage={PAGE_SIZE}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </main>
+      </div>
+
+      {/* Return Notifications Modal */}
+      {showReturnModal && (
+        <ReturnNotificationsModal
+          notifications={returnNotifications}
+          onClose={() => setShowReturnModal(false)}
+          onRefresh={() => {
+            loadNotifications();
+            loadData();
+          }}
+        />
+      )}
+
+      {/* Done Notifications Modal */}
+      {showDoneModal && (
+        <DoneNotificationsModal
+          notifications={doneNotifications}
+          onClose={() => setShowDoneModal(false)}
+          onRefresh={() => {
+            loadNotifications();
+            loadData();
+          }}
+        />
+      )}
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmationModal
+        isOpen={showDeleteModal}
+        itemCount={selectedIds.length}
+        itemType="request"
+        onConfirm={confirmBulkDelete}
+        onCancel={() => setShowDeleteModal(false)}
+      />
+    </div>
+  );
+}
+
+export default function DashboardRequestsPage() {
+  return (
+    <Suspense fallback={<Loader />}>
+      <DashboardRequestsContent />
+    </Suspense>
+  );
+}

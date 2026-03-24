@@ -1,0 +1,248 @@
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import os
+import asyncio
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:password@localhost:5432/postgres")
+
+# Ensure the URL uses the asyncpg driver
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL and DATABASE_URL.startswith("postgresql://") and "asyncpg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=True,
+)
+SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+def get_ph_time():
+    """Returns the current time in Philippines time zone (Asia/Manila) as a naive datetime."""
+    return datetime.now(ZoneInfo("Asia/Manila")).replace(tzinfo=None)
+
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
+
+async def run_startup_migrations(max_attempts: int = 15, delay_seconds: float = 1.0) -> None:
+    """Run small, idempotent schema migrations on startup.
+
+    This keeps existing Postgres volumes compatible with current SQLAlchemy models.
+    """
+    from sqlalchemy import text
+
+    last_error: Exception | None = None
+    for _ in range(max_attempts):
+        try:
+            async with engine.begin() as conn:
+                # Ensure `equipments.availability` exists (older schemas may not have it).
+                await conn.execute(
+                    text("ALTER TABLE equipments ADD COLUMN IF NOT EXISTS availability VARCHAR DEFAULT 'Available';")
+                )
+                await conn.execute(
+                    text("UPDATE equipments SET availability = 'Available' WHERE availability IS NULL;")
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+            await asyncio.sleep(delay_seconds)
+
+    # If we get here, DB wasn't reachable/ready or schema is incompatible.
+    if last_error:
+        raise last_error
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    department = Column(String, nullable=False)
+    phone_number = Column(String, nullable=False)
+    acc_role = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Pending")
+    is_employee = Column(Boolean, nullable=False, default=True)
+    is_approved = Column(Boolean, nullable=False, default=False)
+    hashed_password = Column(String, nullable=False)
+
+class AccountRequest(Base):
+    __tablename__ = "account_requests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    email = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Pending")  # Pending, Approved, Rejected
+    department = Column(String, nullable=True)
+    phone_number = Column(String, nullable=True)
+    acc_role = Column(String, nullable=True)
+    approved_acc_role = Column(String, nullable=True)
+    is_supervisor = Column(Boolean, nullable=False, default=False)
+    is_intern = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    type = Column(String, nullable=False)  # info, success, warning, error
+    is_read = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class Facility(Base):
+    __tablename__ = "facilities"
+    facility_id = Column(Integer, primary_key=True, index=True)
+    facility_name = Column(String, nullable=False)
+    facility_type = Column(String, nullable=False)
+    floor_level = Column(String, nullable=False)
+    capacity = Column(Integer, nullable=True)  # Made optional
+    connection_type = Column(String, nullable=True)
+    cooling_tools = Column(String, nullable=True)
+    building = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+    remarks = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="Available")
+    image_url = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+    updated_at = Column(DateTime, nullable=True)
+
+class Booking(Base):
+    __tablename__ = "bookings"
+    id = Column(Integer, primary_key=True, index=True)
+    bookers_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    facility_id = Column(Integer, ForeignKey("facilities.facility_id", ondelete="CASCADE"), nullable=True)
+    equipment_id = Column(Integer, nullable=True)
+    supply_id = Column(Integer, nullable=True)
+    purpose = Column(String, nullable=False)
+    start_date = Column(String, nullable=False)
+    end_date = Column(String, nullable=False)
+    return_date = Column(String, nullable=True)  # Optional for facility bookings
+    status = Column(String, nullable=False, default="Pending")
+    request_type = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+    updated_at = Column(DateTime, nullable=True)
+
+class Equipment(Base):
+    __tablename__ = "equipments"
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+    name = Column(String, nullable=False)
+    po_number = Column(String, nullable=True)
+    unit_number = Column(String, nullable=True)
+    brand_name = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+    facility = Column(String, nullable=True)
+    facility_id = Column(Integer, ForeignKey("facilities.facility_id"), nullable=True)
+    category = Column(String, nullable=True)
+    status = Column(String, nullable=True)  # Working, In Use, For Repair
+    date_acquire = Column(String, nullable=True)
+    supplier = Column(String, nullable=True)
+    amount = Column(String, nullable=True)
+    estimated_life = Column(String, nullable=True)
+    item_number = Column(String, nullable=True)
+    property_number = Column(String, nullable=True)
+    control_number = Column(String, nullable=True)
+    serial_number = Column(String, nullable=True)
+    person_liable = Column(String, nullable=True)
+    remarks = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+    image = Column(String, nullable=True)
+    availability = Column(String, nullable=True, default="Available")
+
+class Borrowing(Base):
+    __tablename__ = "borrowing"
+    id = Column(Integer, primary_key=True, index=True)
+    borrowed_item = Column(Integer, ForeignKey("equipments.id", ondelete="CASCADE"), nullable=False)
+    borrowers_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    purpose = Column(String, nullable=False)
+    start_date = Column(String, nullable=False)
+    end_date = Column(String, nullable=False)
+    return_date = Column(String, nullable=False)
+    request_status = Column(String, nullable=True)  # Pending, Approved, Rejected
+    return_status = Column(String, nullable=True)  # Returned, Not Returned, Overdue
+    availability = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class Supply(Base):
+    __tablename__ = "supplies"
+    supply_id = Column(Integer, primary_key=True, index=True)
+    supply_name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    category = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False, default=0)
+    stocking_point = Column(Integer, nullable=False, default=0)
+    stock_unit = Column(String, nullable=False)
+    facility_id = Column(Integer, ForeignKey("facilities.facility_id"), nullable=True)
+    remarks = Column(String, nullable=True)
+    image_url = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+    updated_at = Column(DateTime, nullable=True)
+
+class Acquiring(Base):
+    __tablename__ = "acquiring"
+    id = Column(Integer, primary_key=True, index=True)
+    acquirers_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    supply_id = Column(Integer, ForeignKey("supplies.supply_id", ondelete="CASCADE"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    purpose = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="Pending")
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+    updated_at = Column(DateTime, nullable=True)
+
+class ReturnNotification(Base):
+    __tablename__ = "return_notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    borrowing_id = Column(Integer, ForeignKey("borrowing.id", ondelete="CASCADE"), nullable=False)
+    receiver_name = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="Pending")  # Pending, confirmed, rejected
+    message = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class DoneNotification(Base):
+    __tablename__ = "done_notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    booking_id = Column(Integer, ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False)
+    completion_notes = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="Pending")  # Pending, confirmed, dismissed
+    message = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class EquipmentLog(Base):
+    __tablename__ = "equipment_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    equipment_id = Column(Integer, ForeignKey("equipments.id"), nullable=True)
+    action = Column(String, nullable=False)
+    details = Column(String, nullable=True)
+    user_email = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class FacilityLog(Base):
+    __tablename__ = "facility_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    facility_id = Column(Integer, ForeignKey("facilities.facility_id"), nullable=True)
+    action = Column(String, nullable=False)
+    details = Column(String, nullable=True)
+    user_email = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+class SupplyLog(Base):
+    __tablename__ = "supply_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    supply_id = Column(Integer, ForeignKey("supplies.supply_id"), nullable=True)
+    action = Column(String, nullable=False)
+    details = Column(String, nullable=True)
+    user_email = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=get_ph_time)
+
+
+
