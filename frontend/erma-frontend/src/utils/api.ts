@@ -1,5 +1,4 @@
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL || "https://ermav2-backend.onrender.com";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 interface FetchOptions extends RequestInit {
   retries?: number;
@@ -8,7 +7,7 @@ interface FetchOptions extends RequestInit {
 
 export const fetchWithRetry = async (
   url: string,
-  options: FetchOptions = {}
+  options: FetchOptions = {},
 ): Promise<Response> => {
   const { retries = 3, retryDelay = 1000, ...fetchOptions } = options;
 
@@ -17,7 +16,7 @@ export const fetchWithRetry = async (
 
     if (response.status === 500 && retries > 0) {
       console.warn(
-        `Request failed with 500. Retrying in ${retryDelay}ms... (${retries} retries left)`
+        `Request failed with 500. Retrying in ${retryDelay}ms... (${retries} retries left)`,
       );
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
       return fetchWithRetry(url, {
@@ -32,7 +31,7 @@ export const fetchWithRetry = async (
     if (retries > 0) {
       console.warn(
         `Request failed. Retrying in ${retryDelay}ms... (${retries} retries left)`,
-        error
+        error,
       );
       await new Promise((resolve) => setTimeout(resolve, retryDelay));
       return fetchWithRetry(url, {
@@ -47,7 +46,7 @@ export const fetchWithRetry = async (
 
 export const debounce = <T extends (...args: any[]) => any>(
   func: T,
-  wait: number
+  wait: number,
 ) => {
   let timeout: NodeJS.Timeout;
   return (...args: Parameters<T>) => {

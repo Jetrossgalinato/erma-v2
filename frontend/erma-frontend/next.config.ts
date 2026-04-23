@@ -22,11 +22,6 @@ const nextConfig: NextConfig = {
         port: "8000",
         pathname: "/**",
       },
-      {
-        protocol: "https",
-        hostname: "ermav2-backend.onrender.com",
-        pathname: "/**",
-      },
     ],
   },
 
